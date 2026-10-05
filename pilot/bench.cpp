@@ -1,7 +1,9 @@
 // Parse benchmark: tsql_bench [--version TSql160] <rounds> <file>...
 // Parses every file once per round in one process and prints per-round wall
 // time, so the first (cold, ANTLR DFA cache empty) and later (warm) rounds can
-// be compared. Files are read as UTF-8 (strip a BOM).
+// be compared. Files are decoded like tsql_dump does (BOM detection, UTF-8 default); sizes are
+// those of the decoded UTF-8 text.
+#include "ScriptFile.h"
 #include "tsql/parser.hpp"
 
 #include <chrono>
@@ -33,8 +35,7 @@ int main(int argc, char** argv) {
         std::ifstream in(argv[i], std::ios::binary);
         std::stringstream text;
         text << in.rdbuf();
-        std::string s = text.str();
-        if (s.size() >= 3 && s.compare(0, 3, "\xEF\xBB\xBF") == 0) s.erase(0, 3);
+        std::string s = tsql::pilot::DecodeScriptFile(text.str());
         bytes += s.size();
         inputs.push_back(std::move(s));
     }

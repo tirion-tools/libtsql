@@ -62,10 +62,16 @@ void TSql80ParserBase::SetQuotedIdentifier(bool on) {
     }
 }
 
+// C# dereferences the token, then the fragment only for a valid index; a null either way is a
+// NullReferenceException there (internal error 46001), e.g. CREATE OR ALTER PROCEDURE whose body has
+// a syntax error: the statement is dropped and createOrAlterStatements extends it to CREATE.
 void TSql80ParserBase::UpdateTokenInfo(ast::TSqlFragment* fragment, antlr4::Token* token) {
+    if (token == nullptr) throw NullReferenceException();
     size_t tokenIndex = token->getTokenIndex();
-    if (tokenIndex != INVALID_INDEX)
+    if (tokenIndex != INVALID_INDEX) {
+        if (fragment == nullptr) throw NullReferenceException();
         fragment->UpdateTokenInfo(static_cast<int>(tokenIndex), static_cast<int>(tokenIndex));
+    }
 }
 
 void TSql80ParserBase::CreateIdentifierFromLabel(antlr4::Token* token, ast::Identifier* identifier,

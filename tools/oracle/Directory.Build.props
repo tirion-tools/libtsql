@@ -1,7 +1,11 @@
 <Project>
   <!-- Keep build output out of the source tree. Override with -p:OracleBuildRoot=... -->
   <PropertyGroup>
-    <OracleBuildRoot Condition="'$(OracleBuildRoot)' == ''">/tmp/tsql-pilot/build-Oracle</OracleBuildRoot>
+    <!-- the pilot workspace, as tools/diff/workspace.py: $TSQL_PILOT_DIR, default ${XDG_CACHE_HOME:-~/.cache}/tsql-pilot -->
+    <TsqlPilotDir Condition="'$(TSQL_PILOT_DIR)' != ''">$(TSQL_PILOT_DIR)</TsqlPilotDir>
+    <TsqlPilotDir Condition="'$(TsqlPilotDir)' == '' and '$(XDG_CACHE_HOME)' != ''">$(XDG_CACHE_HOME)/tsql-pilot</TsqlPilotDir>
+    <TsqlPilotDir Condition="'$(TsqlPilotDir)' == ''">$(HOME)/.cache/tsql-pilot</TsqlPilotDir>
+    <OracleBuildRoot Condition="'$(OracleBuildRoot)' == ''">$(TsqlPilotDir)/build-Oracle</OracleBuildRoot>
     <BaseIntermediateOutputPath>$(OracleBuildRoot)/obj/</BaseIntermediateOutputPath>
     <BaseOutputPath>$(OracleBuildRoot)/bin/</BaseOutputPath>
   </PropertyGroup>

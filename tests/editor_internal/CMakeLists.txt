@@ -1,6 +1,7 @@
 # Unit tests for the internals of the editor support (src/editor); the contract tests are in tests/editor.
+find_package(Threads REQUIRED)
 add_executable(test_editor_internal test_editor_internal.cpp)
-target_link_libraries(test_editor_internal PRIVATE tsql_editor tsql_parser antlr4_static)
+target_link_libraries(test_editor_internal PRIVATE tsql_editor tsql_parser antlr4_static Threads::Threads)
 target_include_directories(test_editor_internal PRIVATE
     ${PROJECT_SOURCE_DIR}/src/editor ${PROJECT_SOURCE_DIR}/src/parser ${PROJECT_BINARY_DIR}/src/parser)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

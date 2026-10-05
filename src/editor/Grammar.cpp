@@ -24,8 +24,57 @@ const Grammar& GrammarFor(SqlVersion version) {
                                       : "SqlVersion " + std::to_string(static_cast<int>(version))));
 }
 
+namespace {
+
+/// The number of tokens from the token matched at `from` to the token matched at `to` when every
+/// path between them in their rule has the same number (0: not fixed or `to` unreachable).
+size_t FixedDistance(const antlr4::atn::ATN& atn, size_t from, size_t to) {
+    using antlr4::atn::TransitionType;
+    constexpr int kUnknown = -1, kMax = 16;
+    const antlr4::atn::ATNState* start = atn.states[from];
+    // a token match state has exactly one token transition
+    if (start->transitions.size() != 1 || start->transitions[0]->isEpsilon()) return 0;
+    std::vector<std::pair<const antlr4::atn::ATNState*, int>> work = {{start->transitions[0]->target, 1}};
+    std::vector<std::pair<size_t, int>> seen;
+    int found = 0;   // 0: none yet
+    while (!work.empty()) {
+        auto [s, n] = work.back();
+        work.pop_back();
+        if (n > kMax) n = kUnknown;
+        const std::pair<size_t, int> key(s->stateNumber, n);
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+        seen.push_back(key);
+        if (s->stateNumber == to) {
+            if (n == kUnknown || (found != 0 && found != n)) return 0;
+            found = n;
+            continue;
+        }
+        if (s->getStateType() == antlr4::atn::ATNStateType::RULE_STOP) continue;   // left the rule
+        for (const auto& tp : s->transitions) {
+            const antlr4::atn::Transition* t = tp.get();
+            switch (t->getTransitionType()) {
+                case TransitionType::RULE:   // a rule's length is not fixed: continue after it, unknown
+                    work.emplace_back(static_cast<const antlr4::atn::RuleTransition*>(t)->followState, kUnknown);
+                    break;
+                case TransitionType::EPSILON:
+                case TransitionType::ACTION:
+                case TransitionType::PREDICATE:
+                case TransitionType::PRECEDENCE:
+                    work.emplace_back(t->target, n);
+                    break;
+                default:
+                    work.emplace_back(t->target, n == kUnknown ? kUnknown : n + 1);
+                    break;
+            }
+        }
+    }
+    return found > 0 ? static_cast<size_t>(found) : 0;
+}
+
+}  // namespace
+
 void Grammar::Init(SqlVersion v, int flag, antlr4::Parser& parser, const KeywordStateEntry* states, size_t nStates,
-                   const PredicateEntry* preds, size_t nPreds) {
+                   const KeywordGuardEntry* guards, const PredicateEntry* preds, size_t nPreds) {
     version = v;
     versionFlag = flag;
     atn = &parser.getATN();
@@ -41,6 +90,17 @@ void Grammar::Init(SqlVersion v, int flag, antlr4::Parser& parser, const Keyword
         std::sort(ks.words.begin(), ks.words.end());
         ks.words.erase(std::unique(ks.words.begin(), ks.words.end()), ks.words.end());
     }
+    // guards, grouped by (state, guard state) in table order
+    for (const KeywordGuardEntry* e = guards; e->state >= 0;) {
+        const KeywordGuardEntry* first = e;
+        KeywordGuard guard;
+        for (; e->state == first->state && e->guardState == first->guardState; ++e)
+            if ((e->versionMask & versionFlag) != 0) guard.words.emplace_back(e->word);
+        guard.distance = FixedDistance(*atn, static_cast<size_t>(first->guardState), static_cast<size_t>(first->state));
+        if (guard.distance == 0 || guard.words.empty()) continue;
+        std::sort(guard.words.begin(), guard.words.end());
+        keywordGuards[first->state].push_back(std::move(guard));
+    }
     for (size_t i = 0; i < nPreds; ++i) predicates.emplace(static_cast<size_t>(preds[i].index), preds[i].expr);
     for (size_t t = 0; t <= vocabulary->getMaxTokenType(); ++t) {
         const std::string name(vocabulary->getSymbolicName(t));
@@ -50,6 +110,94 @@ void Grammar::Init(SqlVersion v, int flag, antlr4::Parser& parser, const Keyword
         const size_t r = RuleIndex(name);
         if (r != SIZE_MAX) statementRules.push_back(r);
     }
+    InitTopLevel();
+}
+
+namespace {
+
+using antlr4::atn::ATNState;
+using antlr4::atn::TransitionType;
+
+/// The state of rule `rule` from which a RULE transition calls `callee` and that `accept`s.
+template <class Accept>
+size_t FindCall(const antlr4::atn::ATN& atn, size_t rule, size_t callee, const Accept& accept) {
+    for (const ATNState* s : atn.states) {
+        if (s == nullptr || s->ruleIndex != rule) continue;
+        for (const auto& t : s->transitions)
+            if (t->getTransitionType() == TransitionType::RULE &&
+                static_cast<const antlr4::atn::RuleTransition*>(t.get())->ruleIndex == callee && accept(s))
+                return s->stateNumber;
+    }
+    throw std::logic_error("tsql::editor: unexpected script/batch rule shape");
+}
+
+/// Whether `to` is reachable from `from` over epsilon transitions within the rule.
+bool EpsilonReaches(const ATNState* from, const ATNState* to) {
+    std::vector<const ATNState*> work{from};
+    std::vector<size_t> seen;
+    while (!work.empty()) {
+        const ATNState* s = work.back();
+        work.pop_back();
+        if (s == to) return true;
+        if (std::find(seen.begin(), seen.end(), s->stateNumber) != seen.end()) continue;
+        seen.push_back(s->stateNumber);
+        for (const auto& t : s->transitions)
+            if (t->isEpsilon() && t->getTransitionType() != TransitionType::RULE) work.push_back(t->target);
+    }
+    return false;
+}
+
+}  // namespace
+
+void Grammar::InitTopLevel() {
+    TopLevelStates& t = top;
+    t.scriptRule = RuleIndex("script");
+    t.batchRule = RuleIndex("batch");
+    t.statementOptSemiRule = RuleIndex("statementOptSemi");
+    if (t.scriptRule == SIZE_MAX || t.batchRule == SIZE_MAX || t.statementOptSemiRule == SIZE_MAX)
+        throw std::logic_error("tsql::editor: grammar without script/batch/statementOptSemi");
+    const size_t go = tokenTypes.at("Go");
+    for (const ATNState* s : atn->states) {
+        if (s == nullptr || s->ruleIndex != t.scriptRule) continue;
+        for (const auto& tr : s->transitions) {
+            if (tr->getTransitionType() != TransitionType::ATOM) continue;
+            const size_t label = static_cast<const antlr4::atn::AtomTransition*>(tr.get())->_label;
+            if (label == go) t.scriptGo = s->stateNumber;
+            if (label == antlr4::Token::EOF) t.scriptEof = s->stateNumber;
+        }
+        if (s->getStateType() == antlr4::atn::ATNStateType::STAR_LOOP_ENTRY)
+            t.scriptLoopBack = static_cast<const antlr4::atn::StarLoopEntryState*>(s)->loopBackState->stateNumber;
+    }
+    const ATNState* afterGo = atn->states[t.scriptGo]->transitions[0]->target;
+    t.scriptLoopBatchCall =
+        FindCall(*atn, t.scriptRule, t.batchRule, [&](const ATNState* s) { return EpsilonReaches(afterGo, s); });
+    t.scriptFirstBatchCall =
+        FindCall(*atn, t.scriptRule, t.batchRule, [&](const ATNState* s) { return !EpsilonReaches(afterGo, s); });
+    t.batchStatementCall = FindCall(*atn, t.batchRule, t.statementOptSemiRule, [](const ATNState*) { return true; });
+    const ATNState* call = atn->states[t.batchStatementCall];
+    for (const ATNState* s : atn->states) {
+        if (s == nullptr || s->ruleIndex != t.batchRule || s->getStateType() != antlr4::atn::ATNStateType::STAR_LOOP_ENTRY)
+            continue;
+        const auto* entry = static_cast<const antlr4::atn::StarLoopEntryState*>(s);
+        // the loop's body branch (alternative 1) leads to the call
+        if (!EpsilonReaches(entry->transitions[0]->target, call)) continue;
+        t.batchLoopBack = entry->loopBackState->stateNumber;
+        t.batchLoopDecision = static_cast<size_t>(entry->decision);
+    }
+    if (t.batchLoopBack == 0) throw std::logic_error("tsql::editor: unexpected batch rule shape");
+}
+
+bool Grammar::OpaquePredicate(size_t predIndex) const {
+    auto it = predicates.find(predIndex);
+    return it == predicates.end() || it->second.find_first_of("?$") != std::string::npos;
+}
+
+void Grammar::Lex(std::string_view sql, std::vector<LexToken>& out) const {
+    out.clear();
+    LexFrom(sql, 0, true, [&](const LexedToken& t) {
+        out.push_back(t.token);
+        return true;
+    });
 }
 
 size_t Grammar::RuleIndex(std::string_view name) const {

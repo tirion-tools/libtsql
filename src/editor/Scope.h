@@ -19,10 +19,16 @@ namespace tsql::editor::detail {
 /// The parser-visible tokens of the script (up to the end of the caret's batch).
 class ScriptTokens {
 public:
+    /// The parser-visible tokens of `all` (copied).
     ScriptTokens(std::string_view sql, const std::vector<LexToken>& all);
+    /// A view of `count` parser-visible tokens at `visible`.
+    ScriptTokens(std::string_view sql, const LexToken* visible, size_t count) : sql_(sql), toks_(visible), n_(count) {}
+    ScriptTokens(const ScriptTokens&) = delete;
+    ScriptTokens& operator=(const ScriptTokens&) = delete;
+    ScriptTokens(ScriptTokens&&) = default;
 
-    size_t size() const { return toks_.size(); }
-    uint32_t Type(size_t i) const { return i < toks_.size() ? toks_[i].type : 0; }
+    size_t size() const { return n_; }
+    uint32_t Type(size_t i) const { return i < n_ ? toks_[i].type : 0; }
     const LexToken& At(size_t i) const { return toks_[i]; }
     std::string_view Text(size_t i) const;
     /// Whether token i is the keyword or word `upper` (reserved or not; ASCII case-insensitive).
@@ -32,12 +38,16 @@ public:
     std::string Name(size_t i) const;
     /// First token starting at or after byte `offset`.
     size_t IndexAt(size_t offset) const;
+    /// Whether token i is the first parser-visible token on its line.
+    bool LineStart(size_t i) const;
     /// Index of the token just past the GO that ends the batch containing token i's position.
     size_t BatchStart(size_t i) const;
 
 private:
     std::string_view sql_;
-    std::vector<LexToken> toks_;
+    std::vector<LexToken> own_;
+    const LexToken* toks_ = nullptr;
+    size_t n_ = 0;
 };
 
 struct ColumnInfo {
@@ -59,6 +69,7 @@ struct VariableInfo {
     std::string name;   // with @
     std::string type;
     bool isTable = false;
+    const CatalogType* tableType = nullptr;   // declared with a user-defined table type
 };
 
 struct TempTableInfo {
@@ -94,15 +105,36 @@ public:
     /// Columns of the catalog object, CTE, temp table or table variable `parts` names.
     bool ResolveObject(const std::vector<std::string>& parts, SourceInfo& out) const;
 
-    /// Catalog lookups in the caret's database.
+    /// Catalog lookups in the caret's database: `parts` is a written name (schema and database
+    /// optional). Unqualified names look in the default schema, then dbo; unqualified sp_ and xp_
+    /// procedures also in sys, as SQL Server does.
     const CatalogObject* FindObject(const std::vector<std::string>& parts) const;
+    const CatalogType* FindType(const std::vector<std::string>& parts) const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-/// Index of the token where the statement containing token `at` starts, from the tokens alone.
-size_t StatementStartFromTokens(const ScriptTokens& tokens, size_t at);
+/// Index of the token where the statement containing token `at` starts, from the tokens alone,
+/// scanning from token `from` (a statement start; SIZE_MAX: the start of the batch).
+size_t StatementStartFromTokens(const ScriptTokens& tokens, size_t at, size_t from = SIZE_MAX);
+
+// ------------------------------------------------------------------------------------ catalog
+
+/// Whether an object or type of database `objectDb` exists in database `db` (an empty database
+/// is a system object, present in every database).
+bool InDatabase(std::string_view objectDb, std::string_view db);
+/// The object `db.schema.name` (objects of the database first, then system objects).
+const CatalogObject* FindCatalogObject(const Catalog& catalog, std::string_view db, std::string_view schema,
+                                       std::string_view name);
+/// The object a synonym stands for (its target names resolved against the synonym's database and
+/// the catalog's default schema); nullptr when the catalog does not have it (e.g. a linked server).
+const CatalogObject* SynonymTarget(const Catalog& catalog, const CatalogObject& synonym);
+/// The type `db.schema.name` (types of the database first, then those of every database).
+const CatalogType* FindCatalogType(const Catalog& catalog, std::string_view db, std::string_view schema,
+                                   std::string_view name);
+/// The parts of a multi-part name as written in a catalog field ("db.[my schema].t").
+std::vector<std::string> SplitMultiPartName(std::string_view name);
 
 }  // namespace tsql::editor::detail

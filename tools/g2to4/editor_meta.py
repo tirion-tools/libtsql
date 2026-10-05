@@ -134,10 +134,11 @@ def load_helpers(support, consts, flags):
 FUNC_HEAD = re.compile(r'(?:\b\w+::)?\b(\w+)\s*\(([^;{}()]*(?:\([^()]*\)[^;{}()]*)*)\)\s*(?:const\s*)?(?:override\s*)?\{')
 
 
-def load_base_functions(base_dir, consts, helpers):
+def load_base_functions(base_dir, consts, helpers, flags):
     """Hand-written parser-base functions whose first parameter is a token or a token's text ->
     (words their bodies (and the base functions they call) compare it with: keyword constants,
-    upper-case string literals and OptionsHelper mappings; binding). A function is binding when
+    upper-case string literals and OptionsHelper mappings (only those of the version a
+    TryParseOption(t, SqlVersionFlags::V) call names); binding). A function is binding when
     its own body throws and has no ::None fallback result."""
     direct, calls, binding = {}, {}, {}
     files = glob.glob(os.path.join(base_dir, '*.cpp')) + glob.glob(os.path.join(base_dir, '*.h'))
@@ -160,8 +161,14 @@ def load_base_functions(base_dir, consts, helpers):
             for lit in re.findall(r'"([A-Z][A-Z0-9_]*)"', body):
                 if not re.fullmatch(r'SQL\d+', lit):   # error numbers
                     words.add((lit, ALL_FLAGS))
-            for h in re.findall(r'(\w+Helper)::Instance\(\)', body):
-                words.update(helpers.get(h, []))
+            for hm in re.finditer(r'(\w+Helper)::Instance\(\)(\.(\w+)\()?', body):
+                mappings = helpers.get(hm.group(1), [])
+                args = call_args(body, hm.end() - 1)[0] if hm.group(2) else []
+                vm = re.fullmatch(r'SqlVersionFlags::(\w+)', args[1].strip()) if len(args) >= 2 else None
+                if vm and vm.group(1) in flags:
+                    words.update((w, ALL_FLAGS) for w, f in mappings if f & flags[vm.group(1)])
+                else:
+                    words.update(mappings)
             direct.setdefault(name, set()).update(words)
             calls.setdefault(name, set()).update(re.findall(r'\b(\w+)\(', body))
             throws = re.search(r'\bthrow\b|\bThrow\w*Exception\(', body) is not None
@@ -181,6 +188,85 @@ def load_base_functions(base_dir, consts, helpers):
     return funcs
 
 
+def load_identifier_functions(base_dir, consts):
+    """Hand-written parser-base functions taking ast::Identifier* parameters (ParseSecurityObjectKind(
+    id1, id2, id3), ...) -> {(name, arity): ([(words, binding) per parameter], {word: enumerator})}:
+    the words each identifier's text is compared with (Match / TryMatch(p, K), a switch on p->Value,
+    Str_ToUpperInvariant(p->Value) == K, and the same in the functions it passes p to). A parameter
+    with words is binding when its function (or one it passes p to) throws or calls Match and has
+    no ::None fallback (the ParseSecurityObjectKind overloads: every path checks or throws). The
+    second item maps each word of a one-identifier switch to the enumerator it returns."""
+    direct, calls, binding, results = {}, {}, {}, {}
+    files = glob.glob(os.path.join(base_dir, '*.cpp'))
+    for path in sorted(files):
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        for m in FUNC_HEAD.finditer(text):
+            name, params = m.group(1), m.group(2)
+            if name in ('if', 'while', 'for', 'switch', 'catch', 'return') or 'ast::Identifier*' not in params:
+                continue
+            names = []
+            for p in split_args(params):
+                pm = re.fullmatch(r'\s*ast::Identifier\*\s*(\w+)\s*', p)
+                names.append(pm.group(1) if pm else None)
+            key = (name, len(names))
+            body = text[m.end() - 1:balanced(text, m.end() - 1)]
+            words = [set() for _ in names]
+            for i, p in enumerate(names):
+                if p is None:
+                    continue
+                for c in re.findall(r'\b(?:Try)?Match\(\s*%s\s*,\s*CodeGenerationSupporter::(\w+)\s*\)' % p, body):
+                    if c in consts:
+                        words[i].add(consts[c])
+                for c in re.findall(r'Str_ToUpperInvariant\(\s*%s->Value\s*\)\s*==\s*CodeGenerationSupporter::(\w+)' % p, body):
+                    if c in consts:
+                        words[i].add(consts[c])
+            # switches: const std::string sw_(...p->Value...); ... sw_ == CodeGenerationSupporter::K
+            decls = list(re.finditer(r'\bsw_\(([^;]*)\);', body))
+            for k, d in enumerate(decls):
+                end = decls[k + 1].start() if k + 1 < len(decls) else len(body)
+                for i, p in enumerate(names):
+                    if p is not None and re.search(r'\b%s->Value\b' % p, d.group(1)):
+                        for c in re.findall(r'\bsw_ == CodeGenerationSupporter::(\w+)', body[d.end():end]):
+                            if c in consts:
+                                words[i].add(consts[c])
+            # one-identifier switches that return an enumerator per word: word -> enumerator
+            if len(names) == 1:
+                for c, e in re.findall(r'\bsw_ == CodeGenerationSupporter::(\w+)\)\s*\{\s*return ast::\w+::(\w+);', body):
+                    if c in consts:
+                        results.setdefault(key, {})[consts[c].upper()] = e
+            links = []
+            for cm in re.finditer(r'(?<![\w.>:])(\w+)\(', body):
+                if cm.group(1) in ('if', 'while', 'for', 'switch', 'return', 'sw_'):
+                    continue
+                args, _ = call_args(body, cm.end() - 1)
+                for j, arg in enumerate(args):
+                    for i, p in enumerate(names):
+                        if p is not None and arg.strip() == p:
+                            links.append((i, (cm.group(1), len(args)), j))
+            throws = re.search(r'\bthrow\b|\bThrow\w*Exception\(|\bMatch\(', body) is not None
+            direct[key] = words
+            calls[key] = links
+            binding[key] = throws and re.search(r'::None\b', body) is None
+    funcs = {}
+    for key in direct:
+        out = []
+        for i in range(len(direct[key])):
+            seen, todo, words, bind = {(key, i)}, [(key, i)], set(), binding[key]
+            while todo:
+                k, pi = todo.pop()
+                words |= direct[k][pi]
+                for src, callee, j in calls[k]:
+                    if src == pi and callee in direct and (callee, j) not in seen:
+                        seen.add((callee, j))
+                        todo.append((callee, j))
+                        bind = bind or binding[callee]
+            out.append((words, bind and bool(words)))
+        if any(w for w, _ in out):
+            funcs[key] = (out, results.get(key, {}))
+    return funcs
+
+
 # ----------------------------------------------------------------------------------- predicates
 
 
@@ -188,12 +274,18 @@ class PredParser:
     """Predicate C++ expression -> s-expression string:
          m<k>:<WORD>;    NextTokenMatches(WORD, k)
          t<k>:<type>;    LA(k) == <token type name>
-         !<e>  &<n><e>..  |<n><e>..   ?   (opaque: unknown at completion time)"""
+         b<k>:<WORD>;    the token k before the current one is WORD
+         T               true
+         !<e>  &<n><e>..  |<n><e>..
+         $   opaque, reads the tokens only (a look-ahead scan, a syntactic predicate): the editor
+             runs it on the tokens before the caret
+         ?   opaque, reads the rule's locals: run only where the parser's own rule context is live"""
 
-    def __init__(self, text, consts):
+    def __init__(self, text, consts, rule=''):
         self.s = text
         self.i = 0
         self.consts = consts
+        self.rule = rule
 
     def ws(self):
         while self.i < len(self.s) and self.s[self.i].isspace():
@@ -252,6 +344,15 @@ class PredParser:
         return self.atom(self.s[start:self.i].strip())
 
     def atom(self, a):
+        if self.rule == 'builtInFunctionCall':
+            # builtInFunctionCall: nonQuotedIdentifier LeftParenthesis ( {FunctionName == X}? ... ): the
+            # name is the token two before the alternatives
+            if re.fullmatch(r'_localctx->vResult->FunctionName != nullptr', a):
+                return 'T'
+            m = re.fullmatch(r'Str_ToUpper\(_localctx->vResult->FunctionName->Value, CultureInfo::InvariantCulture\) == '
+                             r'CodeGenerationSupporter::(\w+)', a)
+            if m and m.group(1) in self.consts:
+                return 'b2:%s;' % self.consts[m.group(1)].upper()
         m = re.fullmatch(r'NextTokenMatches\(\(?CodeGenerationSupporter::(\w+)\)?(?:,\s*(\d+))?\)', a)
         if m and m.group(1) in self.consts:
             return 'm%s:%s;' % (m.group(2) or '1', self.consts[m.group(1)].upper())
@@ -262,18 +363,19 @@ class PredParser:
         m = re.fullmatch(r'\(?\s*LA\((\d+)\)\s*==\s*(?:\w+::)?(\w+)\s*\)?', a)
         if m:
             return 't%s:%s;' % (m.group(1), m.group(2))
-        return '?'
+        # the editor runs the whole predicate: it reads rule locals if any part does
+        return '?' if '_localctx' in self.s else '$'
 
 
 def load_predicates(sources, consts):
     preds = {}
     for text in sources:
-        for m in re.finditer(r'bool \w+::\w+Sempred\(\w+ \*_localctx, size_t predicateIndex\) \{', text):
+        for m in re.finditer(r'bool \w+::(\w+)Sempred\(\w+ \*_localctx, size_t predicateIndex\) \{', text):
             body = text[m.end() - 1:balanced(text, m.end() - 1)]
             for cm in re.finditer(r'case (\d+): return ', body):
                 end = body.index(';\n', cm.end())
                 expr = ' '.join(body[cm.end():end].split())
-                preds[int(cm.group(1))] = PredParser(expr, consts).parse_or()
+                preds[int(cm.group(1))] = PredParser(expr, consts, m.group(1)).parse_or()
     return preds
 
 
@@ -288,9 +390,15 @@ BINDING_CALLS = {'Match', 'ParseOption'}
 WORD_CALLS = {'Match', 'TryMatch'}
 
 
-def keyword_states(text, consts, helpers, funcs):
-    """state -> [{word: mask}, binding]"""
-    states = {}
+ELEMENT = re.compile(r'setState\((\d+)\);\s*\n\s*(?:antlrcpp::downCast<\w+ \*>\(_localctx\)->\w+ = )?match\(\w+::\w+\);')
+
+
+def keyword_states(text, consts, helpers, funcs, idfuncs):
+    """-> (state -> [{word: mask}, binding], (state, guard state) -> {word: mask}).
+    A guard: the action after the token matched at `state` requires the token matched earlier at
+    `guard state` (in the same rule) to be one of the words (Match(tParameter, IMPORTANCE) after
+    tImpValue=Identifier in workloadGroupParameter)."""
+    states, guards = {}, {}
     starts = [m.start() for m in RULE_FN.finditer(text)] + [len(text)]
     for a, b in zip(starts, starts[1:]):
         body = text[a:b]
@@ -313,10 +421,50 @@ def keyword_states(text, consts, helpers, funcs):
             prior = [s for p, s in binds.get(label, []) if p <= pos]
             return prior[-1] if prior else None
 
+        def add(st, words, binding):
+            entry = states.setdefault(st, [{}, False])
+            for w, f in words:
+                entry[0][w.upper()] = entry[0].get(w.upper(), 0) | f
+            entry[1] = entry[1] or binding
+
+        # token matches in text order: (end of the statement, state)
+        elements = [(m.end(), int(m.group(1))) for m in ELEMENT.finditer(body)]
+
+        def element_before(pos):
+            """The token match whose action runs the call at `pos` unconditionally (no other element,
+            decision, if / else / switch / ?: or open brace between)."""
+            prior = [(e, s) for e, s in elements if e <= pos]
+            if not prior:
+                return None
+            between = body[prior[-1][0]:pos]
+            if re.search(r'setState\(|\bif\b|\belse\b|\bswitch\b|\bcase\b|\?|\{|\}', between):
+                return None
+            return prior[-1][1]
+
         for m in CALL.finditer(body):
             helper, fn = m.group(1), m.group(2)
             args, _ = call_args(body, m.end() - 1)
             if not args:
+                continue
+            if helper is None and (fn, len(args)) in idfuncs:
+                params, results = idfuncs[(fn, len(args))]
+                # an action that rejects every result but one: vResult->set_X(fn(id)); if (!(vResult->X == E::K)) throw
+                only = None
+                sm = re.search(r'set_(\w+)\($', body[max(0, m.start() - 80):m.start()])
+                if sm and results:
+                    action_end = body.find('setState(', m.end())
+                    om = re.search(r'if\s*\(\s*!\s*\(\s*\w+->%s\s*==\s*ast::\w+::(\w+)\s*\)\s*\)' % sm.group(1),
+                                   body[m.end():action_end if action_end >= 0 else len(body)])
+                    if om:
+                        only = {w for w, e in results.items() if e == om.group(1)}
+                # each identifier argument: the words its parameter is compared with
+                for arg, (words, binding) in zip(args, params):
+                    am = re.fullmatch(r'\$?(\w+)', arg.strip())
+                    st = state_of(am.group(1), m.start()) if am else None
+                    if only is not None:
+                        words = {w for w in words if w.upper() in only}
+                    if st is not None and words:
+                        add(st, [(w, ALL_FLAGS) for w in words], binding)
                 continue
             first = args[0].strip()
             lm = re.fullmatch(r'\$?(\w+)(?:->[\w()>-]*)?', first)
@@ -344,11 +492,13 @@ def keyword_states(text, consts, helpers, funcs):
             elif fn in funcs:
                 words, binding = list(funcs[fn][0]), funcs[fn][1]
             if words:
-                entry = states.setdefault(st, [{}, False])
-                for w, f in words:
-                    entry[0][w.upper()] = entry[0].get(w.upper(), 0) | f
-                entry[1] = entry[1] or binding
-    return states
+                add(st, words, binding)
+                owner = element_before(m.start())
+                if binding and owner is not None and owner != st:
+                    g = guards.setdefault((owner, st), {})
+                    for w, f in words:
+                        g[w.upper()] = g.get(w.upper(), 0) | f
+    return states, guards
 
 
 # ------------------------------------------------------------------------------------- output
@@ -370,27 +520,41 @@ def main():
     consts = load_constants(a.support)
     flags = load_flags(a.support)
     helpers = load_helpers(a.support, consts, flags)
-    funcs = load_base_functions(a.base_dir, consts, helpers)
+    funcs = load_base_functions(a.base_dir, consts, helpers, flags)
+    idfuncs = load_identifier_functions(a.base_dir, consts)
     sources = []
     for path in sorted(glob.glob(os.path.join(a.parser_dir, a.grammar + 'Parser*.cpp'))):
         with open(path, encoding='utf-8') as f:
             sources.append(f.read())
     preds = load_predicates(sources, consts)
-    states = {}
+    states, guards = {}, {}
     for text in sources:
-        for st, (words, binding) in keyword_states(text, consts, helpers, funcs).items():
+        found, found_guards = keyword_states(text, consts, helpers, funcs, idfuncs)
+        for st, (words, binding) in found.items():
             entry = states.setdefault(st, [{}, False])
             for w, f in words.items():
                 entry[0][w] = entry[0].get(w, 0) | f
             entry[1] = entry[1] or binding
+        for key, words in found_guards.items():
+            entry = guards.setdefault(key, {})
+            for w, f in words.items():
+                entry[w] = entry.get(w, 0) | f
 
     lines = ['// GENERATED by tools/g2to4/editor_meta.py from the %s parser. Do not edit.' % a.grammar,
-             '// Keyword states: {ATN state, word, SqlVersionFlags mask, binding}; predicates: {index, expression}.',
+             '// Keyword states: {ATN state, word, SqlVersionFlags mask, binding}; guards: {ATN state, guard',
+             '// state, word, mask}; predicates: {index, expression}.',
              'static const ::tsql::editor::detail::KeywordStateEntry kKeywordStates[] = {']
     for st in sorted(states):
         words, binding = states[st]
         for w in sorted(words):
             lines.append('    {%d, %s, 0x%x, %s},' % (st, cstr(w), words[w], 'true' if binding else 'false'))
+    lines.append('};')
+    lines.append('static const ::tsql::editor::detail::KeywordGuardEntry kKeywordGuards[] = {')
+    for st, guard in sorted(guards):
+        words = guards[(st, guard)]
+        for w in sorted(words):
+            lines.append('    {%d, %d, %s, 0x%x},' % (st, guard, cstr(w), words[w]))
+    lines.append('    {-1, -1, "", 0},   // end (keeps the array non-empty)')
     lines.append('};')
     lines.append('static const ::tsql::editor::detail::PredicateEntry kPredicates[] = {')
     for i in sorted(preds):
@@ -401,8 +565,9 @@ def main():
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         with open(a.out, 'w', encoding='utf-8') as f:
             f.write(out)
-    print('%s: %d keyword states, %d predicates (%d opaque)' % (
-        a.grammar, len(states), len(preds), sum(1 for p in preds.values() if p == '?')), file=sys.stderr)
+    print('%s: %d keyword states, %d guards, %d predicates (%d opaque)' % (
+        a.grammar, len(states), len(guards), len(preds), sum(1 for p in preds.values() if '?' in p or '$' in p)),
+        file=sys.stderr)
 
 
 if __name__ == '__main__':

@@ -120,6 +120,9 @@
      "expect": [{"text": "GO", "class": "Keyword"}, {"text": "DBCC", "class": "Keyword"}, {"text": "FREEPROCCACHE", "class": ["Keyword", "Identifier"]}, {"text": "CHECKPOINT", "class": "Keyword"}, {"text": "TOP", "class": "Keyword"}, {"text": "SUM", "class": "BuiltinFunction"}, {"text": "Units", "class": "Identifier"}, {"text": "[Order Details]", "class": "QuotedIdentifier"}, {"text": "NOLOCK", "class": "Keyword"}, {"text": "Units", "nth": 2, "class": "Identifier"}, {"text": "DESC", "class": "Keyword"}, {"text": "RECOMPILE", "class": "Keyword"}, {"text": "MAXDOP", "class": "Keyword"}, {"text": "WAITFOR", "class": "Keyword"}, {"text": "DELAY", "class": "Keyword"}, {"text": "'00:00:01'", "class": "String"}]},
     {"id": "utf8-offsets", "version": "TSql170",
      "sql": "SELECT u.Betrag AS [Größe €] FROM Reporting.dbo.Umsätze AS u -- Größe\nWHERE u.Jahr = 2024",
-     "expect": [{"text": "Betrag", "class": "Identifier"}, {"text": "[Größe €]", "class": "QuotedIdentifier"}, {"text": "Umsätze", "class": "Identifier"}, {"text": "AS", "nth": 2, "class": "Keyword"}, {"text": "-- Größe", "class": "Comment"}, {"text": "\n", "class": "Whitespace"}, {"text": "WHERE", "class": "Keyword"}, {"text": "2024", "class": "Number"}]}
+     "expect": [{"text": "Betrag", "class": "Identifier"}, {"text": "[Größe €]", "class": "QuotedIdentifier"}, {"text": "Umsätze", "class": "Identifier"}, {"text": "AS", "nth": 2, "class": "Keyword"}, {"text": "-- Größe", "class": "Comment"}, {"text": "\n", "class": "Whitespace"}, {"text": "WHERE", "class": "Keyword"}, {"text": "2024", "class": "Number"}]},
+    {"id": "batch-after-error-batch", "version": "TSql170",
+     "sql": "SELECT 1;\n)\nGO\nSET NOCOUNT ON",
+     "expect": [{"text": "SET", "class": "Keyword"}, {"text": "NOCOUNT", "class": "Keyword"}, {"text": "ON", "class": "Keyword"}]}
   ]
 }

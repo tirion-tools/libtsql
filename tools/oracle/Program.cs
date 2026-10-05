@@ -290,7 +290,12 @@ internal sealed record SourceInfo(string Path, string Source, string Sha256, str
 
 internal static class Program
 {
-    private const string DefaultAst = "/tmp/tsql-pilot/ssd/SqlScriptDom/Parser/TSql/Ast.xml";
+    // The pilot workspace, as tools/diff/workspace.py: $TSQL_PILOT_DIR, default ${XDG_CACHE_HOME:-~/.cache}/tsql-pilot.
+    private static readonly string DefaultAst = Path.Combine(
+        Environment.GetEnvironmentVariable("TSQL_PILOT_DIR") is { Length: > 0 } dir ? dir
+            : Path.Combine(Environment.GetEnvironmentVariable("XDG_CACHE_HOME") is { Length: > 0 } cache ? cache
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache"), "tsql-pilot"),
+        "ssd/SqlScriptDom/Parser/TSql/Ast.xml");
 
     private static int Main(string[] args)
     {

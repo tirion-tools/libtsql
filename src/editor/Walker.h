@@ -22,8 +22,13 @@ struct WalkInput {
     int startState = -1;
     size_t startIndex = 0;
     std::vector<int> outerFollow;   // innermost first; empty: the start state's rule is outermost
+    int startPending = -1;          // Capture::pendingCall: a rule call's keyword check for the next token
     size_t caret = 0;               // parser-token index of the caret (tokens->size() when it is the end)
     size_t budget = 400'000;        // configurations visited at most
+    /// Runs an opaque predicate of the grammar with the real parser on the tokens before the caret
+    /// (CaretSession::EvaluatePredicate: rule, predicate, token index, whether the walk still stands
+    /// where the parser stood (its rule locals apply) -> 1, 0, -1).
+    std::function<int(size_t, size_t, size_t, bool)> evaluate;
 };
 
 /// One way a token can stand at the caret.
@@ -36,6 +41,9 @@ struct WalkCandidate {
     const std::vector<std::string>* hints = nullptr;
     /// Rule indexes from the rule the token is matched in outwards.
     const std::vector<size_t>* rules = nullptr;
+    /// The statement the walk started in ended before the token (it follows that statement in its
+    /// batch, block, IF, WHILE or module body).
+    bool nextStatement = false;
 };
 
 struct WalkStats {

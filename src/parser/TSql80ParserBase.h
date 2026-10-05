@@ -82,6 +82,7 @@ protected:
     template <class T, class U>
     static void AddAndUpdateTokenInfo(ast::TSqlFragment* node, std::vector<T*>& collection, U* item) {
         collection.push_back(item);
+        if (node == nullptr) throw NullReferenceException();
         node->UpdateTokenInfo(item);
     }
     template <class T, class U>

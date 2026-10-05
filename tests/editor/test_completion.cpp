@@ -1,5 +1,6 @@
 // Contract tests for tsql::editor (include/tsql/editor.hpp): Complete() against completion_cases.json and
-// Classify() against classify_cases.json, both with the fixture catalog catalog.json in the same directory.
+// Classify() against classify_cases.json, both with the fixture catalog catalog.json in the same directory
+// (Document: test_document.cpp).
 //
 //   test_completion [--validate-only] [--suite completion|classify|all] [--filter TEXT] [--as-version NAME] [--verbose]
 //                   CASES_DIR
@@ -17,7 +18,10 @@
 //   mustInclude / mustExclude: [{kind, label[, insertText]}]: kind is a CompletionKind name or an array of
 //        acceptable kinds (omitted in mustExclude = any kind); label matches case-insensitively, and for Keyword,
 //        TableHint and QueryHint also matches an item label that is a phrase starting with it ("ORDER" matches
-//        "ORDER BY"); insertText, when given, must equal the item's insertText exactly,
+//        "ORDER BY"); insertText, when given, must equal the item's insertText exactly; mustInclude items may also
+//        give detailContains (strings that must occur in the item's detail in this order) and detailExcludes
+//        (strings that must not occur), both case-insensitive whole words ("int" does not match "bigint"); any item
+//        may give exact: true to turn off the phrase match ("END" then does not match "END CONVERSATION"),
 //   expectedReplace (optional): {start, length}, UTF-8 byte offsets into the caret-less sql,
 //   topN (optional): [{kind, label, n}]: a matching item must be among the first n items,
 //   noItems (optional): true = no items at all (caret in a comment, string or number),
@@ -26,276 +30,17 @@
 //   occurrence of text in sql must be covered only by spans whose class is `class` (a TokenClass name or an array
 //   of acceptable names).
 // catalog.json: {currentDatabase, defaultSchema, databases: [...], objects: [{database, schema, name, type,
-//   columns: [[name, type]...]}]}.
+//   columns: [[name, type]...], parameters: [[name, type, "output"?, "default"?]...], target}], types: [{database,
+//   schema, name, isTableType, columns}]}; an empty database is a system object/type (every database).
 // Every result is also checked against the contract's invariants (see CheckCompletionInvariants and
 // CheckClassifyInvariants).
-#include "tsql/editor.hpp"
-#include "tsql/parser.hpp"
+#include "contract_support.h"
 
-#include <algorithm>
-#include <cctype>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
 #include <map>
-#include <optional>
-#include <set>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
 
 namespace {
 
-using tsql::SqlVersion;
-using namespace tsql::editor;
-
-// ---------------------------------------------------------------------------------------------- minimal JSON
-
-struct Json {
-    enum class Type { Null, Bool, Number, String, Array, Object };
-    Type type = Type::Null;
-    bool boolean = false;
-    double number = 0;
-    std::string str;
-    std::vector<Json> arr;
-    std::vector<std::pair<std::string, Json>> obj;
-
-    const Json* get(std::string_view key) const {
-        for (const auto& [k, v] : obj)
-            if (k == key) return &v;
-        return nullptr;
-    }
-};
-
-class JsonParser {
-public:
-    explicit JsonParser(std::string_view text) : s_(text) {}
-
-    Json parseDocument() {
-        Json v = parseValue();
-        skipWs();
-        if (i_ != s_.size()) fail("trailing characters");
-        return v;
-    }
-
-private:
-    [[noreturn]] void fail(const std::string& msg) const {
-        size_t line = 1 + static_cast<size_t>(std::count(s_.begin(), s_.begin() + static_cast<long>(std::min(i_, s_.size())), '\n'));
-        throw std::runtime_error("JSON line " + std::to_string(line) + ": " + msg);
-    }
-    void skipWs() {
-        while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\n' || s_[i_] == '\r')) ++i_;
-    }
-    bool consume(char c) {
-        skipWs();
-        if (i_ < s_.size() && s_[i_] == c) { ++i_; return true; }
-        return false;
-    }
-    void expect(char c) {
-        if (!consume(c)) fail(std::string("expected '") + c + "'");
-    }
-    Json parseValue() {
-        skipWs();
-        if (i_ >= s_.size()) fail("unexpected end");
-        Json v;
-        char c = s_[i_];
-        if (c == '{') {
-            ++i_;
-            v.type = Json::Type::Object;
-            if (consume('}')) return v;
-            do {
-                skipWs();
-                if (i_ >= s_.size() || s_[i_] != '"') fail("expected key");
-                std::string key = parseString();
-                for (const auto& kv : v.obj)
-                    if (kv.first == key) fail("duplicate key " + key);
-                expect(':');
-                v.obj.emplace_back(std::move(key), parseValue());
-            } while (consume(','));
-            expect('}');
-        } else if (c == '[') {
-            ++i_;
-            v.type = Json::Type::Array;
-            if (consume(']')) return v;
-            do v.arr.push_back(parseValue()); while (consume(','));
-            expect(']');
-        } else if (c == '"') {
-            v.type = Json::Type::String;
-            v.str = parseString();
-        } else if (s_.substr(i_, 4) == "true") {
-            i_ += 4; v.type = Json::Type::Bool; v.boolean = true;
-        } else if (s_.substr(i_, 5) == "false") {
-            i_ += 5; v.type = Json::Type::Bool;
-        } else if (s_.substr(i_, 4) == "null") {
-            i_ += 4;
-        } else if (c == '-' || (c >= '0' && c <= '9')) {
-            size_t start = i_++;
-            while (i_ < s_.size() && std::strchr("0123456789.eE+-", s_[i_])) ++i_;
-            v.type = Json::Type::Number;
-            v.number = std::strtod(std::string(s_.substr(start, i_ - start)).c_str(), nullptr);
-        } else {
-            fail("unexpected character");
-        }
-        return v;
-    }
-    unsigned hex4() {
-        if (i_ + 4 > s_.size()) fail("bad \\u escape");
-        unsigned cp = 0;
-        for (int k = 0; k < 4; ++k) {
-            char h = s_[i_++];
-            cp <<= 4;
-            if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
-            else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
-            else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
-            else fail("bad \\u escape");
-        }
-        return cp;
-    }
-    std::string parseString() {
-        ++i_;  // opening quote
-        std::string out;
-        while (true) {
-            if (i_ >= s_.size()) fail("unterminated string");
-            char c = s_[i_++];
-            if (c == '"') return out;
-            if (static_cast<unsigned char>(c) < 0x20) fail("control character in string");
-            if (c != '\\') { out += c; continue; }
-            if (i_ >= s_.size()) fail("unterminated escape");
-            char e = s_[i_++];
-            switch (e) {
-                case '"': out += '"'; break;
-                case '\\': out += '\\'; break;
-                case '/': out += '/'; break;
-                case 'b': out += '\b'; break;
-                case 'f': out += '\f'; break;
-                case 'n': out += '\n'; break;
-                case 'r': out += '\r'; break;
-                case 't': out += '\t'; break;
-                case 'u': {
-                    unsigned cp = hex4();
-                    if (cp >= 0xD800 && cp < 0xDC00) {
-                        if (s_.substr(i_, 2) != "\\u") fail("lone surrogate");
-                        i_ += 2;
-                        unsigned lo = hex4();
-                        if (lo < 0xDC00 || lo >= 0xE000) fail("bad surrogate pair");
-                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                    }
-                    if (cp < 0x80) {
-                        out += static_cast<char>(cp);
-                    } else if (cp < 0x800) {
-                        out += static_cast<char>(0xC0 | (cp >> 6));
-                        out += static_cast<char>(0x80 | (cp & 0x3F));
-                    } else if (cp < 0x10000) {
-                        out += static_cast<char>(0xE0 | (cp >> 12));
-                        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                        out += static_cast<char>(0x80 | (cp & 0x3F));
-                    } else {
-                        out += static_cast<char>(0xF0 | (cp >> 18));
-                        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-                        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                        out += static_cast<char>(0x80 | (cp & 0x3F));
-                    }
-                    break;
-                }
-                default: fail("bad escape");
-            }
-        }
-    }
-
-    std::string_view s_;
-    size_t i_ = 0;
-};
-
-// ---------------------------------------------------------------------------------------------- names
-
-const std::pair<CompletionKind, const char*> kKinds[] = {
-    {CompletionKind::Keyword, "Keyword"},
-    {CompletionKind::Database, "Database"},
-    {CompletionKind::Schema, "Schema"},
-    {CompletionKind::Table, "Table"},
-    {CompletionKind::View, "View"},
-    {CompletionKind::Column, "Column"},
-    {CompletionKind::ScalarFunction, "ScalarFunction"},
-    {CompletionKind::TableFunction, "TableFunction"},
-    {CompletionKind::Procedure, "Procedure"},
-    {CompletionKind::Alias, "Alias"},
-    {CompletionKind::Cte, "Cte"},
-    {CompletionKind::TempTable, "TempTable"},
-    {CompletionKind::TableVariable, "TableVariable"},
-    {CompletionKind::Variable, "Variable"},
-    {CompletionKind::DataType, "DataType"},
-    {CompletionKind::TableHint, "TableHint"},
-    {CompletionKind::QueryHint, "QueryHint"},
-    {CompletionKind::BuiltinFunction, "BuiltinFunction"},
-};
-
-const std::pair<TokenClass, const char*> kClasses[] = {
-    {TokenClass::Keyword, "Keyword"},
-    {TokenClass::Identifier, "Identifier"},
-    {TokenClass::QuotedIdentifier, "QuotedIdentifier"},
-    {TokenClass::Variable, "Variable"},
-    {TokenClass::String, "String"},
-    {TokenClass::Number, "Number"},
-    {TokenClass::Comment, "Comment"},
-    {TokenClass::Operator, "Operator"},
-    {TokenClass::Punctuation, "Punctuation"},
-    {TokenClass::BuiltinFunction, "BuiltinFunction"},
-    {TokenClass::DataType, "DataType"},
-    {TokenClass::Whitespace, "Whitespace"},
-    {TokenClass::Error, "Error"},
-};
-
-const std::pair<CatalogObject::Type, const char*> kObjectTypes[] = {
-    {CatalogObject::Type::Table, "Table"},
-    {CatalogObject::Type::View, "View"},
-    {CatalogObject::Type::ScalarFunction, "ScalarFunction"},
-    {CatalogObject::Type::TableFunction, "TableFunction"},
-    {CatalogObject::Type::Procedure, "Procedure"},
-};
-
-template <typename E, size_t N>
-const char* NameOf(const std::pair<E, const char*> (&table)[N], E value) {
-    for (const auto& [v, name] : table)
-        if (v == value) return name;
-    return "?";
-}
-
-template <typename E, size_t N>
-std::optional<E> FromName(const std::pair<E, const char*> (&table)[N], std::string_view name) {
-    for (const auto& [v, n] : table)
-        if (name == n) return v;
-    return std::nullopt;
-}
-
-std::string Lower(std::string_view s) {
-    std::string out(s);
-    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return out;
-}
-
-bool StartsWithCi(std::string_view s, std::string_view prefix) {
-    return s.size() >= prefix.size() && Lower(s.substr(0, prefix.size())) == Lower(prefix);
-}
-
-bool ContainsCi(std::string_view hay, std::string_view needle) {
-    return Lower(hay).find(Lower(needle)) != std::string::npos;
-}
-
-std::string Quote(std::string_view s) {
-    std::string out = "\"";
-    for (char c : s) {
-        if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else if (c == '"') out += "\\\"";
-        else out += c;
-    }
-    return out + "\"";
-}
+using namespace editor_contract;
 
 // ---------------------------------------------------------------------------------------------- case model
 
@@ -303,6 +48,9 @@ struct ItemSpec {
     std::vector<CompletionKind> kinds;  // empty: any kind (mustExclude only)
     std::string label;
     std::optional<std::string> insertText;
+    bool exact = false;  // the label must equal the item's label (no phrase match: "END" does not match "END CONVERSATION")
+    std::vector<std::string> detailContains;  // must occur in the item's detail, in this order (case-insensitive)
+    std::vector<std::string> detailExcludes;  // must not occur in the item's detail (case-insensitive, whole word)
     size_t n = 0;  // topN only
 
     std::string describe() const {
@@ -310,6 +58,9 @@ struct ItemSpec {
         for (CompletionKind kind : kinds) k += (k.empty() ? "" : "/") + std::string(NameOf(kKinds, kind));
         std::string out = (k.empty() ? "*" : k) + ":" + label;
         if (insertText) out += " (insert " + Quote(*insertText) + ")";
+        if (exact) out += " (exact)";
+        for (const auto& d : detailContains) out += " (detail has " + Quote(d) + ")";
+        for (const auto& d : detailExcludes) out += " (detail lacks " + Quote(d) + ")";
         if (n) out += " in top " + std::to_string(n);
         return out;
     }
@@ -337,140 +88,7 @@ struct ClassifyCase {
     std::vector<ClassifyExpect> expects;
 };
 
-class Errors {
-public:
-    void add(const std::string& where, const std::string& msg) { list_.push_back(where + ": " + msg); }
-    bool empty() const { return list_.empty(); }
-    void print() const {
-        for (const auto& e : list_) std::fprintf(stderr, "invalid: %s\n", e.c_str());
-    }
-
-private:
-    std::vector<std::string> list_;
-};
-
-std::optional<std::string> ReadFile(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
-
-std::optional<Json> LoadJson(const std::string& path, Errors& errors) {
-    auto text = ReadFile(path);
-    if (!text) {
-        errors.add(path, "cannot read");
-        return std::nullopt;
-    }
-    try {
-        return JsonParser(*text).parseDocument();
-    } catch (const std::exception& e) {
-        errors.add(path, e.what());
-        return std::nullopt;
-    }
-}
-
-const std::string* GetString(const Json& obj, std::string_view key) {
-    const Json* v = obj.get(key);
-    return v && v->type == Json::Type::String ? &v->str : nullptr;
-}
-
-void CheckKeys(const Json& obj, std::initializer_list<std::string_view> allowed, const std::string& where, Errors& errors) {
-    for (const auto& kv : obj.obj)
-        if (std::find(allowed.begin(), allowed.end(), kv.first) == allowed.end())
-            errors.add(where, "unknown field '" + kv.first + "'");
-}
-
-// ---------------------------------------------------------------------------------------------- catalog
-
-std::optional<Catalog> LoadCatalog(const std::string& path, Errors& errors) {
-    auto doc = LoadJson(path, errors);
-    if (!doc) return std::nullopt;
-    if (doc->type != Json::Type::Object) {
-        errors.add(path, "not an object");
-        return std::nullopt;
-    }
-    CheckKeys(*doc, {"_comment", "currentDatabase", "defaultSchema", "databases", "objects"}, path, errors);
-    Catalog catalog;
-    const std::string* current = GetString(*doc, "currentDatabase");
-    const std::string* schema = GetString(*doc, "defaultSchema");
-    const Json* dbs = doc->get("databases");
-    const Json* objects = doc->get("objects");
-    if (!current || !schema || !dbs || dbs->type != Json::Type::Array || !objects || objects->type != Json::Type::Array) {
-        errors.add(path, "needs currentDatabase, defaultSchema (strings), databases and objects (arrays)");
-        return std::nullopt;
-    }
-    catalog.currentDatabase = *current;
-    catalog.defaultSchema = *schema;
-    for (const Json& d : dbs->arr) {
-        if (d.type != Json::Type::String || d.str.empty()) errors.add(path, "databases: expected non-empty strings");
-        else catalog.databases.push_back(d.str);
-    }
-    auto hasDb = [&](const std::string& name) {
-        return std::any_of(catalog.databases.begin(), catalog.databases.end(),
-                           [&](const std::string& d) { return Lower(d) == Lower(name); });
-    };
-    if (!hasDb(catalog.currentDatabase)) errors.add(path, "currentDatabase not in databases");
-    std::set<std::string> seen;
-    for (const Json& o : objects->arr) {
-        std::string where = path + " object";
-        const std::string *db = GetString(o, "database"), *sc = GetString(o, "schema"), *name = GetString(o, "name"),
-                          *type = GetString(o, "type");
-        if (!db || !sc || !name || !type) {
-            errors.add(where, "needs database, schema, name, type strings");
-            continue;
-        }
-        where += " " + *db + "." + *sc + "." + *name;
-        CheckKeys(o, {"database", "schema", "name", "type", "columns"}, where, errors);
-        CatalogObject obj;
-        obj.database = *db;
-        obj.schema = *sc;
-        obj.name = *name;
-        auto t = FromName(kObjectTypes, *type);
-        if (!t) {
-            errors.add(where, "unknown type " + *type);
-            continue;
-        }
-        obj.type = *t;
-        if (!hasDb(*db)) errors.add(where, "database not in databases");
-        if (!seen.insert(Lower(*db + "." + *sc + "." + *name)).second) errors.add(where, "duplicate object");
-        if (const Json* cols = o.get("columns")) {
-            for (const Json& c : cols->arr) {
-                if (c.type != Json::Type::Array || c.arr.size() != 2 || c.arr[0].type != Json::Type::String ||
-                    c.arr[1].type != Json::Type::String || c.arr[0].str.empty()) {
-                    errors.add(where, "columns: expected [name, type] string pairs");
-                    continue;
-                }
-                obj.columns.push_back({c.arr[0].str, c.arr[1].str});
-            }
-        }
-        bool hasColumns = obj.type == CatalogObject::Type::Table || obj.type == CatalogObject::Type::View ||
-                          obj.type == CatalogObject::Type::TableFunction;
-        if (hasColumns == obj.columns.empty())
-            errors.add(where, hasColumns ? "tables, views and table functions need columns" : "only tables, views and table functions have columns");
-        catalog.objects.push_back(std::move(obj));
-    }
-    return catalog;
-}
-
 // ---------------------------------------------------------------------------------------------- case loading
-
-bool ParseVersion(const Json& c, const std::string& where, std::string& name, SqlVersion& version, Errors& errors) {
-    const std::string* v = GetString(c, "version");
-    if (!v) {
-        errors.add(where, "missing version");
-        return false;
-    }
-    name = *v;
-    static const std::set<std::string> kEditorVersions = {"TSql130", "TSql140", "TSql150", "TSql160",
-                                                          "TSql170", "TSql180", "TSqlFabricDW"};
-    if (!kEditorVersions.count(*v) || !tsql::SqlVersionFromGrammarName(*v, version)) {
-        errors.add(where, "version must be one of TSql130..TSql180, TSqlFabricDW");
-        return false;
-    }
-    return true;
-}
 
 // Whether a mustInclude/mustExclude/topN entry names something that exists: catalog objects in the catalog,
 // script-defined names (aliases, CTEs, variables, temp tables, derived columns) in the case's sql. Catches typos
@@ -486,16 +104,28 @@ bool ReferenceExists(const ItemSpec& spec, const Catalog& catalog, const std::st
         case CompletionKind::Database:
             return std::any_of(catalog.databases.begin(), catalog.databases.end(), [&](const std::string& d) { return ieq(d, spec.label); });
         case CompletionKind::Schema:
-            return std::any_of(catalog.objects.begin(), catalog.objects.end(), [&](const CatalogObject& o) { return ieq(o.schema, spec.label); });
+            return std::any_of(catalog.objects.begin(), catalog.objects.end(), [&](const CatalogObject& o) { return ieq(o.schema, spec.label); }) ||
+                   std::any_of(catalog.types.begin(), catalog.types.end(), [&](const CatalogType& t) { return ieq(t.schema, spec.label); });
         case CompletionKind::Table: return objectOf(CatalogObject::Type::Table);
         case CompletionKind::View: return objectOf(CatalogObject::Type::View);
         case CompletionKind::ScalarFunction: return objectOf(CatalogObject::Type::ScalarFunction);
         case CompletionKind::TableFunction: return objectOf(CatalogObject::Type::TableFunction);
         case CompletionKind::Procedure: return objectOf(CatalogObject::Type::Procedure);
+        case CompletionKind::Synonym: return objectOf(CatalogObject::Type::Synonym);
+        case CompletionKind::UserType:
+            return std::any_of(catalog.types.begin(), catalog.types.end(), [&](const CatalogType& t) { return ieq(t.name, spec.label); });
+        case CompletionKind::Parameter:
+            for (const auto& o : catalog.objects)
+                for (const auto& p : o.parameters)
+                    if (ieq(p.name, spec.label)) return true;
+            return false;
         case CompletionKind::Column:
             if (ContainsCi(sql, spec.label)) return true;
             for (const auto& o : catalog.objects)
                 for (const auto& c : o.columns)
+                    if (ieq(c.name, spec.label)) return true;
+            for (const auto& t : catalog.types)
+                for (const auto& c : t.columns)
                     if (ieq(c.name, spec.label)) return true;
             return false;
         case CompletionKind::Alias:
@@ -514,8 +144,10 @@ std::optional<ItemSpec> ParseItem(const Json& j, bool kindRequired, bool isTop, 
         errors.add(where, "item is not an object");
         return std::nullopt;
     }
-    if (isTop) CheckKeys(j, {"kind", "label", "n"}, where, errors);
-    else CheckKeys(j, {"kind", "label", "insertText"}, where, errors);
+    bool isInclude = kindRequired && !isTop;
+    if (isTop) CheckKeys(j, {"kind", "label", "n", "exact"}, where, errors);
+    else if (isInclude) CheckKeys(j, {"kind", "label", "insertText", "detailContains", "detailExcludes", "exact"}, where, errors);
+    else CheckKeys(j, {"kind", "label", "insertText", "exact"}, where, errors);
     ItemSpec spec;
     const Json* kind = j.get("kind");
     std::vector<const Json*> kindNames;
@@ -541,9 +173,25 @@ std::optional<ItemSpec> ParseItem(const Json& j, bool kindRequired, bool isTop, 
         return std::nullopt;
     }
     spec.label = *label;
+    if (const Json* e = j.get("exact")) {
+        if (e->type != Json::Type::Bool) errors.add(where, "exact must be a boolean");
+        else spec.exact = e->boolean;
+    }
     if (const Json* it = j.get("insertText")) {
         if (it->type != Json::Type::String || it->str.empty()) errors.add(where, "insertText must be a non-empty string");
         else spec.insertText = it->str;
+    }
+    for (auto [key, out] : {std::pair{"detailContains", &spec.detailContains}, std::pair{"detailExcludes", &spec.detailExcludes}}) {
+        const Json* list = j.get(key);
+        if (!list) continue;
+        if (list->type != Json::Type::Array || list->arr.empty()) {
+            errors.add(where, std::string(key) + " must be a non-empty array of non-empty strings");
+            continue;
+        }
+        for (const Json& s : list->arr) {
+            if (s.type != Json::Type::String || s.str.empty()) errors.add(where, std::string(key) + " must hold non-empty strings");
+            else out->push_back(s.str);
+        }
     }
     if (isTop) {
         const Json* n = j.get("n");
@@ -746,18 +394,42 @@ bool IsPhraseKind(CompletionKind k) {
     return k == CompletionKind::Keyword || k == CompletionKind::TableHint || k == CompletionKind::QueryHint;
 }
 
-bool Matches(const ItemSpec& spec, const CompletionItem& item, bool checkInsert) {
-    if (!spec.kinds.empty() && std::find(spec.kinds.begin(), spec.kinds.end(), item.kind) == spec.kinds.end()) return false;
-    bool labelOk = Lower(item.label) == Lower(spec.label) ||
-                   (IsPhraseKind(item.kind) && StartsWithCi(item.label, spec.label + " "));
-    if (!labelOk) return false;
-    return !checkInsert || !spec.insertText || item.insertText == *spec.insertText;
+bool IsWordChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '@' || c == '#' || static_cast<unsigned char>(c) >= 0x80;
 }
 
-std::string DescribeItem(const CompletionItem& item) {
-    std::string out = std::string(NameOf(kKinds, item.kind)) + ":" + item.label;
-    if (item.insertText != item.label) out += "=" + item.insertText;
-    return out;
+// Case-insensitive position of `needle` in `hay` at or after `from`, not inside a longer word ("int" is not found
+// in "bigint"); npos if absent.
+size_t FindWordCi(std::string_view hay, std::string_view needle, size_t from) {
+    std::string h = Lower(hay), n = Lower(needle);
+    for (size_t pos = h.find(n, from); pos != std::string::npos; pos = h.find(n, pos + 1)) {
+        bool startOk = pos == 0 || !IsWordChar(n.front()) || !IsWordChar(h[pos - 1]);
+        size_t end = pos + n.size();
+        bool endOk = end == h.size() || !IsWordChar(n.back()) || !IsWordChar(h[end]);
+        if (startOk && endOk) return pos;
+    }
+    return std::string::npos;
+}
+
+bool DetailMatches(const ItemSpec& spec, const CompletionItem& item) {
+    size_t from = 0;
+    for (const auto& d : spec.detailContains) {
+        size_t pos = FindWordCi(item.detail, d, from);
+        if (pos == std::string::npos) return false;
+        from = pos + d.size();
+    }
+    for (const auto& d : spec.detailExcludes)
+        if (FindWordCi(item.detail, d, 0) != std::string::npos) return false;
+    return true;
+}
+
+// checkExtras: also insertText and detail (mustInclude only).
+bool Matches(const ItemSpec& spec, const CompletionItem& item, bool checkExtras) {
+    if (!spec.kinds.empty() && std::find(spec.kinds.begin(), spec.kinds.end(), item.kind) == spec.kinds.end()) return false;
+    bool labelOk = Lower(item.label) == Lower(spec.label) ||
+                   (!spec.exact && IsPhraseKind(item.kind) && StartsWithCi(item.label, spec.label + " "));
+    if (!labelOk) return false;
+    return !checkExtras || ((!spec.insertText || item.insertText == *spec.insertText) && DetailMatches(spec, item));
 }
 
 std::string ListItems(const std::vector<CompletionItem>& items, size_t limit) {
@@ -765,27 +437,6 @@ std::string ListItems(const std::vector<CompletionItem>& items, size_t limit) {
     for (size_t i = 0; i < items.size() && i < limit; ++i) out += (i ? ", " : "") + DescribeItem(items[i]);
     if (items.size() > limit) out += ", ... (" + std::to_string(items.size()) + " items)";
     return out.empty() ? "(none)" : out;
-}
-
-// Contract invariants that hold for every Complete() result.
-void CheckCompletionInvariants(const CompletionCase& tc, const CompletionResult& r, std::vector<std::string>& issues) {
-    if (r.replaceStart > tc.caret || r.replaceStart + r.replaceLength < tc.caret || r.replaceStart + r.replaceLength > tc.sql.size()) {
-        issues.push_back("replace range [" + std::to_string(r.replaceStart) + "," + std::to_string(r.replaceStart + r.replaceLength) +
-                         ") does not contain the caret " + std::to_string(tc.caret) + " within the input");
-        return;
-    }
-    std::string typed = tc.sql.substr(r.replaceStart, tc.caret - r.replaceStart);
-    if (!typed.empty() && (typed[0] == '[' || typed[0] == '"')) typed.erase(0, 1);
-    for (const auto& item : r.items) {
-        if (item.label.empty() || item.insertText.empty()) {
-            issues.push_back("item with empty label or insertText: " + DescribeItem(item));
-            continue;
-        }
-        std::string_view insert = item.insertText;
-        if (!insert.empty() && insert[0] == '[') insert.remove_prefix(1);
-        if (!StartsWithCi(item.label, typed) && !StartsWithCi(insert, typed))
-            issues.push_back("item " + DescribeItem(item) + " does not match the typed prefix " + Quote(typed));
-    }
 }
 
 bool RunCompletionCase(const CompletionCase& tc, const Catalog& baseCatalog, bool verbose) {
@@ -799,7 +450,7 @@ bool RunCompletionCase(const CompletionCase& tc, const Catalog& baseCatalog, boo
         issues.push_back(std::string("Complete threw: ") + e.what());
     }
     if (issues.empty()) {
-        CheckCompletionInvariants(tc, r, issues);
+        CheckCompletionInvariants(tc.sql, tc.caret, r, issues);
         if (tc.noItems && !r.items.empty()) issues.push_back("expected no items");
         if (tc.replace && (r.replaceStart != tc.replace->first || r.replaceLength != tc.replace->second))
             issues.push_back("replace range is {" + std::to_string(r.replaceStart) + ", " + std::to_string(r.replaceLength) +
@@ -808,7 +459,8 @@ bool RunCompletionCase(const CompletionCase& tc, const Catalog& baseCatalog, boo
             auto exact = std::find_if(r.items.begin(), r.items.end(), [&](const CompletionItem& it) { return Matches(spec, it, true); });
             if (exact != r.items.end()) continue;
             auto loose = std::find_if(r.items.begin(), r.items.end(), [&](const CompletionItem& it) { return Matches(spec, it, false); });
-            if (loose != r.items.end()) issues.push_back("wrong insertText for " + spec.describe() + ": got " + Quote(loose->insertText));
+            if (loose != r.items.end())
+                issues.push_back("wrong insertText/detail for " + spec.describe() + ": got " + Quote(loose->insertText) + ", detail " + Quote(loose->detail));
             else issues.push_back("missing " + spec.describe());
         }
         for (const auto& spec : tc.exclude)
@@ -828,21 +480,6 @@ bool RunCompletionCase(const CompletionCase& tc, const Catalog& baseCatalog, boo
         std::printf("  got replace {%zu, %zu}: %s\n", r.replaceStart, r.replaceLength, ListItems(r.items, verbose ? 1000 : 25).c_str());
     }
     return issues.empty();
-}
-
-// Contract invariants that hold for every Classify() result.
-void CheckClassifyInvariants(std::string_view sql, const std::vector<ColouredSpan>& spans, std::vector<std::string>& issues) {
-    size_t expected = 0;
-    for (const auto& s : spans) {
-        if (s.length == 0) issues.push_back("empty span at " + std::to_string(s.start));
-        if (s.start != expected) {
-            issues.push_back("span at " + std::to_string(s.start) + " should start at " + std::to_string(expected) + " (gap or overlap)");
-            return;
-        }
-        expected = s.start + s.length;
-    }
-    if (expected != sql.size())
-        issues.push_back("spans cover " + std::to_string(expected) + " of " + std::to_string(sql.size()) + " bytes");
 }
 
 bool RunClassifyCase(const ClassifyCase& tc, bool verbose) {
@@ -894,6 +531,7 @@ int Usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);  // keep the reports of earlier cases if one crashes
     bool validateOnly = false, verbose = false;
     std::string suite = "all", filter, dir, asVersionName;
     for (int i = 1; i < argc; ++i) {

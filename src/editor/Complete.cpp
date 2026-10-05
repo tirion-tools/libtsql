@@ -1,5 +1,6 @@
-// tsql::editor::Complete: the caret's word and replace range, the parser configuration at the caret
-// (Grammar::ParseToCaret), the tokens that can follow it (Walk), what kind of name each candidate
+// Completion (tsql::editor::Complete, Document::Complete): the caret's word and replace range, the
+// parser configuration at the caret (Grammar::ParseToCaret from where the script's parse starts the
+// statement before it), the tokens that can follow it (Walk), what kind of name each candidate
 // Identifier is (from the rules it is matched in), the names in scope (ScopeAnalyzer) and the
 // catalog, ranked.
 #include <algorithm>
@@ -9,7 +10,7 @@
 #include <unordered_map>
 
 #include "Builtins.h"
-#include "Grammar.h"
+#include "Editor.h"
 #include "Names.h"
 #include "Scope.h"
 #include "Walker.h"
@@ -34,35 +35,57 @@ bool OneOf(uint32_t type, std::initializer_list<T> types) {
 
 // ------------------------------------------------------------------------------------- rule tags
 
-enum Tag : uint32_t {
-    kWrapper = 1u << 0,          // identifier, nonQuotedIdentifier, identifierList, identifierListElement
-    kObjectName = 1u << 1,       // schemaObject...PartName
-    kTableReference = 1u << 2,   // schemaObjectOrFunctionTableReference
-    kDmlTarget = 1u << 3,        // dmlTarget and its schemaObject... alternatives
-    kProcedureRef = 1u << 4,     // procedureReference, procObjectReference
-    kObjectTarget = 1u << 5,     // CREATE INDEX / STATISTICS ... ON, UPDATE STATISTICS, TRUNCATE, ALTER TABLE ...
-    kDataType = 1u << 6,         // scalarDataType, dataTypeSchemaObjectName
-    kMultiPart = 1u << 7,        // multiPartIdentifier
-    kColumnExpression = 1u << 8, // columnOrFunctionCall, selectStarExpression
-    kTargetColumn = 1u << 9,     // insertColumn, mergeInsertDmlColumn, setClause, identifierColumnReferenceExpression
-    kBuiltinCall = 1u << 10,     // builtInFunctionCall
-    kGlobalTvf = 1u << 11,       // globalFunctionTableReference
-    kTableHint = 1u << 12,
-    kQueryHint = 1u << 13,
-    kExpressionPrimary = 1u << 14,
-    kOrderBy = 1u << 15,
-    kTableVariableRef = 1u << 16,   // variableTableReference, variableDmlTarget
-    kVariableDefinition = 1u << 17, // DECLARE @x, parameters
-    kNoNames = 1u << 18,            // variableMethodCallTableReference, ...
-    kFunctionTarget = 1u << 19,     // schemaObjectFunctionDmlTarget: INSERT INTO f(arguments)
-    kSetCommand = 1u << 20,         // setCommand: SET DEADLOCK_PRIORITY value, ...
+enum Tag : uint64_t {
+    kWrapper = 1ull << 0,          // identifier, nonQuotedIdentifier, identifierList, identifierListElement
+    kObjectName = 1ull << 1,       // schemaObject...PartName
+    kTableReference = 1ull << 2,   // schemaObjectOrFunctionTableReference
+    kDmlTarget = 1ull << 3,        // dmlTarget and its schemaObject... alternatives
+    kProcedureRef = 1ull << 4,     // procedureReference, procObjectReference
+    kObjectTarget = 1ull << 5,     // CREATE INDEX / STATISTICS ... ON, UPDATE STATISTICS, TRUNCATE, ALTER TABLE ...
+    kDataType = 1ull << 6,         // scalarDataType, dataTypeSchemaObjectName
+    kMultiPart = 1ull << 7,        // multiPartIdentifier
+    kColumnExpression = 1ull << 8, // columnOrFunctionCall, selectStarExpression
+    kTargetColumn = 1ull << 9,     // insertColumn, mergeInsertDmlColumn, setClause, identifierColumnReferenceExpression
+    kBuiltinCall = 1ull << 10,     // builtInFunctionCall
+    kGlobalTvf = 1ull << 11,       // globalFunctionTableReference
+    kTableHint = 1ull << 12,
+    kQueryHint = 1ull << 13,
+    kExpressionPrimary = 1ull << 14,
+    kOrderBy = 1ull << 15,
+    kTableVariableRef = 1ull << 16,   // variableTableReference, variableDmlTarget
+    kVariableDefinition = 1ull << 17, // DECLARE @x, parameters
+    kNoNames = 1ull << 18,            // variableMethodCallTableReference, ...
+    kFunctionTarget = 1ull << 19,     // schemaObjectFunctionDmlTarget: INSERT INTO f(arguments)
+    kSetCommand = 1ull << 20,         // setCommand: SET DEADLOCK_PRIORITY value, ...
+    kTableTypeAllowed = 1ull << 21,   // a variable's or parameter's type: a table type is allowed too
+    kVariableRule = 1ull << 22,       // variable
+    kSetParam = 1ull << 23,           // setParam: an EXEC argument ([@name =] value)
+    kEndConversation = 1ull << 24,    // endConversationStatement: END is END CONVERSATION
+    kQuerySpecification = 1ull << 25, // querySpecification (its ON <filegroup> needs INTO)
+    kColumnRef = 1ull << 26,          // column: a column of the sources (FOR UPDATE OF, CONTAINS (...))
+    kDropObject = 1ull << 27,         // dropObject, dropObjectList: the names of a DROP statement
+    kDropTable = 1ull << 28,          // dropTableStatement, ... : what that DROP drops
+    kDropView = 1ull << 29,
+    kDropProcedure = 1ull << 30,
+    kDropFunction = 1ull << 31,
+    kDropSynonym = 1ull << 32,
+    kComputedColumn = 1ull << 33,     // computedColumnBody: a column's AS expression
+    kPeriodDefinition = 1ull << 34,   // tablePeriodDefinition: PERIOD FOR SYSTEM_TIME (start, end)
+};
+
+/// How the walk reached a keyword (Contexts::keywordPaths).
+enum KeywordPath : uint8_t {
+    kInStatement = 1,      // inside the statement the caret is in
+    kAfterStatement = 2,   // as the start of a statement after it
+    kColumnStart = 4,      // a column definition's data type or AS
+    kPeriod = 8,           // PERIOD FOR SYSTEM_TIME (a column named PERIOD would need a data type)
 };
 
 bool Contains(std::string_view s, std::string_view part) { return s.find(part) != std::string_view::npos; }
 bool StartsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
-uint32_t TagsOfRule(std::string_view n) {
-    uint32_t tags = 0;
+uint64_t TagsOfRule(std::string_view n) {
+    uint64_t tags = 0;
     if (n == "identifier" || n == "nonQuotedIdentifier" || n == "identifierList" || n == "identifierListElement")
         tags |= kWrapper;
     if (StartsWith(n, "schemaObject") && Contains(n, "PartName")) tags |= kObjectName;
@@ -97,16 +120,30 @@ uint32_t TagsOfRule(std::string_view n) {
     if (n == "variableMethodCallTableReference" || n == "stringOrIdentifier") tags |= kNoNames;
     if (n == "schemaObjectFunctionDmlTarget") tags |= kFunctionTarget;
     if (n == "setCommand") tags |= kSetCommand;
+    if (n == "declareVariableElement" || n == "scalarProcedureParameter") tags |= kTableTypeAllowed;
+    if (n == "variable") tags |= kVariableRule;
+    if (n == "setParam") tags |= kSetParam;
+    if (n == "endConversationStatement") tags |= kEndConversation;
+    if (n == "querySpecification") tags |= kQuerySpecification;
+    if (n == "column") tags |= kColumnRef;
+    if (n == "dropObject" || n == "dropObjectList") tags |= kDropObject;
+    if (n == "dropTableStatement") tags |= kDropTable;
+    if (n == "dropViewStatement") tags |= kDropView;
+    if (n == "dropProcedureStatement") tags |= kDropProcedure;
+    if (n == "dropFunctionStatement") tags |= kDropFunction;
+    if (n == "dropSynonymStatement") tags |= kDropSynonym;
+    if (n == "computedColumnBody") tags |= kComputedColumn;
+    if (n == "tablePeriodDefinition") tags |= kPeriodDefinition;
     return tags;
 }
 
-const std::vector<uint32_t>& RuleTags(const Grammar& g) {
+const std::vector<uint64_t>& RuleTags(const Grammar& g) {
     static std::mutex mutex;
-    static std::unordered_map<const Grammar*, std::vector<uint32_t>> cache;
+    static std::unordered_map<const Grammar*, std::vector<uint64_t>> cache;
     std::lock_guard<std::mutex> lock(mutex);
     auto it = cache.find(&g);
     if (it != cache.end()) return it->second;
-    std::vector<uint32_t> tags;
+    std::vector<uint64_t> tags;
     tags.reserve(g.ruleNames->size());
     for (const std::string& n : *g.ruleNames) tags.push_back(TagsOfRule(n));
     return cache.emplace(&g, std::move(tags)).first->second;
@@ -128,17 +165,38 @@ struct Contexts {
     bool scalarVariables = false;
     bool orderBy = false;
     bool setCommandValue = false; // SET <command> |
+    bool tableTypes = false;      // with dataType: user-defined table types too
+    bool execParameters = false;  // EXEC procedure ... | where a parameter name can follow
+    bool sourceColumns = false;   // columns of the query's sources only (FOR UPDATE OF ...)
+    bool selectIntoOn = false;    // SELECT ... INTO t ON <filegroup>: ON only right after INTO t
+    uint32_t dropTypes = 0;       // DROP <kind> names: bits 1 << CatalogObject::Type
     std::set<std::string> typeNames;
     std::vector<std::pair<std::string, CompletionKind>> keywords;
     std::set<std::string> keywordSeen;
+    std::map<std::string, uint8_t> keywordPaths;   // KeywordPath bits of each keyword
 
     bool Any() const {
         return expression || builtinFunctions || tableSource || dmlTarget || objectTarget || procedure || dataType ||
-               targetColumns || tableVariables || scalarVariables || setCommandValue || !keywords.empty();
+               targetColumns || tableVariables || scalarVariables || setCommandValue || execParameters ||
+               sourceColumns || selectIntoOn || dropTypes != 0 || !keywords.empty();
     }
-    void AddKeyword(const std::string& word, CompletionKind kind) {
+    void AddKeyword(const std::string& word, CompletionKind kind, uint8_t paths = kInStatement) {
+        keywordPaths[word] |= paths;
         if (keywordSeen.insert(word + '\x01' + std::to_string(static_cast<int>(kind))).second)
             keywords.emplace_back(word, kind);
+    }
+    /// Whether a keyword was reached by paths `only` and no other.
+    bool AnyKeywordOnly(uint8_t only) const {
+        for (const auto& [word, paths] : keywordPaths)
+            if ((paths & ~only) == 0) return true;
+        return false;
+    }
+    /// Drops the keywords `drop` says to (by their paths).
+    template <class Drop>
+    void DropKeywords(const Drop& drop) {
+        keywords.erase(std::remove_if(keywords.begin(), keywords.end(),
+                                      [&](const auto& k) { return drop(keywordPaths[k.first]); }),
+                       keywords.end());
     }
     void Merge(const Contexts& o) {
         expression |= o.expression;
@@ -153,8 +211,14 @@ struct Contexts {
         scalarVariables |= o.scalarVariables;
         orderBy |= o.orderBy;
         setCommandValue |= o.setCommandValue;
+        tableTypes |= o.tableTypes;
+        execParameters |= o.execParameters;
+        sourceColumns |= o.sourceColumns;
+        selectIntoOn |= o.selectIntoOn;
+        dropTypes |= o.dropTypes;
         typeNames.insert(o.typeNames.begin(), o.typeNames.end());
-        for (const auto& [word, kind] : o.keywords) AddKeyword(word, kind);
+        for (const auto& [word, kind] : o.keywords) AddKeyword(word, kind, 0);
+        for (const auto& [word, paths] : o.keywordPaths) keywordPaths[word] |= paths;
     }
 };
 
@@ -167,54 +231,75 @@ public:
 
     void Add(const WalkCandidate& c) {
         const std::vector<size_t>& rules = *c.rules;
-        auto tag = [&](size_t k) { return k < rules.size() ? tags_[rules[k]] : 0u; };
-        auto within = [&](size_t n, uint32_t mask) {
+        auto tag = [&](size_t k) { return k < rules.size() ? tags_[rules[k]] : uint64_t{0}; };
+        auto within = [&](size_t n, uint64_t mask) {
             for (size_t k = 0; k < n && k < rules.size(); ++k)
                 if (tags_[rules[k]] & mask) return true;
             return false;
         };
         Contexts& ctx = InFunctionArguments(rules) ? functionArgs_ : main_;
+        const uint8_t paths = static_cast<uint8_t>((c.nextStatement ? kAfterStatement : kInStatement) |
+                                                   (within(rules.size(), kDataType | kComputedColumn) ? kColumnStart : 0) |
+                                                   (within(rules.size(), kPeriodDefinition) ? kPeriod : 0));
         const auto type = static_cast<uint32_t>(c.tokenType);
         if (type == Ty(T::Identifier) || type == Ty(T::QuotedIdentifier)) {
             if (c.words != nullptr) {
-                for (const std::string& w : *c.words) Keyword(ctx, w, within);
+                for (const std::string& w : *c.words) Keyword(ctx, w, within, paths);
                 return;
             }
             size_t k = 0;
             while (tag(k) & kWrapper) ++k;
-            const uint32_t first = tag(k);
+            const uint64_t first = tag(k);
             if (first & kNoNames) return;
             if (first & kObjectName) {
                 while (tag(k) & kObjectName) ++k;
-                const uint32_t next = tag(k);
+                const uint64_t next = tag(k);
                 if (next & kTableReference) ctx.tableSource = true;
                 else if (next & kDmlTarget) ctx.dmlTarget = true;
                 else if (next & kProcedureRef) ctx.procedure = true;
                 else if (next & kObjectTarget) ctx.objectTarget = true;
+                else if (next & kDropObject) ctx.dropTypes |= DropTypes(rules, k);
             } else if (first & kDataType) {
                 ctx.dataType = true;
                 if (c.hints != nullptr) ctx.typeNames.insert(c.hints->begin(), c.hints->end());
+                while (tag(k) & kDataType) ++k;
+                if (tag(k) & kTableTypeAllowed) ctx.tableTypes = true;
             } else if (first & kMultiPart) {
-                const uint32_t next = tag(k + 1);
+                const uint64_t next = tag(k + 1);
                 if (next & kColumnExpression) {
                     ctx.expression = true;
                     if (within(rules.size(), kOrderBy)) ctx.orderBy = true;
                 } else if (next & kTargetColumn) {
                     ctx.targetColumns = true;
+                } else if (next & kColumnRef) {
+                    ctx.sourceColumns = true;
                 }
             } else if (first & kBuiltinCall) {
                 ctx.builtinFunctions = true;
+            } else if (first & kPeriodDefinition) {
+                ctx.targetColumns = true;   // PERIOD FOR SYSTEM_TIME (start column, end column)
             } else if (within(3, kSetCommand)) {
                 ctx.setCommandValue = true;
             }
             return;
         }
         if (type == Ty(T::Variable)) {
-            if (within(4, kTableVariableRef)) ctx.tableVariables = true;
+            if ((tag(0) & kVariableRule) && (tag(1) & kSetParam)) ctx.execParameters = true;   // @name = value
+            else if (within(4, kTableVariableRef)) ctx.tableVariables = true;
             else if (!within(4, kVariableDefinition | kNoNames)) ctx.scalarVariables = true;
             return;
         }
-        if (const char* text = KeywordText(type)) Keyword(ctx, Upper(text), within);
+        if (const char* text = KeywordText(type)) {
+            std::string word = Upper(text);
+            // END at a statement start only begins END CONVERSATION (END of a block comes from the block)
+            if (word == "END" && (tag(0) & kEndConversation)) word = "END CONVERSATION";
+            // querySpecification's ON <filegroup> is rejected by its action unless INTO precedes it
+            if (word == "ON" && (tag(0) & kQuerySpecification)) {
+                ctx.selectIntoOn = true;
+                return;
+            }
+            Keyword(ctx, word, within, paths);
+        }
     }
 
 private:
@@ -225,16 +310,30 @@ private:
         return false;
     }
 
+    /// What the DROP statement around the dropObject at rules[k] drops.
+    uint32_t DropTypes(const std::vector<size_t>& rules, size_t k) const {
+        auto bit = [](CatalogObject::Type t) { return 1u << static_cast<unsigned>(t); };
+        for (; k < rules.size(); ++k) {
+            const uint64_t t = tags_[rules[k]];
+            if (t & kDropTable) return bit(CatalogObject::Type::Table);
+            if (t & kDropView) return bit(CatalogObject::Type::View);
+            if (t & kDropProcedure) return bit(CatalogObject::Type::Procedure);
+            if (t & kDropFunction) return bit(CatalogObject::Type::ScalarFunction) | bit(CatalogObject::Type::TableFunction);
+            if (t & kDropSynonym) return bit(CatalogObject::Type::Synonym);
+        }
+        return 0;
+    }
+
     template <class Within>
-    void Keyword(Contexts& ctx, const std::string& word, const Within& within) {
+    void Keyword(Contexts& ctx, const std::string& word, const Within& within, uint8_t paths) {
         CompletionKind kind = CompletionKind::Keyword;
         if (within(4, kTableHint)) kind = CompletionKind::TableHint;
         else if (within(3, kQueryHint)) kind = CompletionKind::QueryHint;
         else if (within(3, kExpressionPrimary) && FindBuiltin(word) != nullptr) kind = CompletionKind::BuiltinFunction;
-        ctx.AddKeyword(word, kind);
+        ctx.AddKeyword(word, kind, paths);
     }
 
-    const std::vector<uint32_t>& tags_;
+    const std::vector<uint64_t>& tags_;
     Contexts& main_;
     Contexts& functionArgs_;
 };
@@ -349,26 +448,29 @@ std::vector<std::string> Qualifier(const ScriptTokens& t, size_t caretTok) {
 
 int KindRank(CompletionKind k) {
     switch (k) {
-        case CompletionKind::Column: return 0;
-        case CompletionKind::Alias: return 1;
-        case CompletionKind::Cte: return 2;
-        case CompletionKind::TempTable: return 3;
-        case CompletionKind::TableVariable: return 4;
-        case CompletionKind::Table: return 5;
-        case CompletionKind::View: return 6;
-        case CompletionKind::TableFunction: return 7;
-        case CompletionKind::Procedure: return 8;
-        case CompletionKind::Variable: return 9;
-        case CompletionKind::ScalarFunction: return 10;
-        case CompletionKind::DataType: return 11;
-        case CompletionKind::TableHint: return 12;
-        case CompletionKind::QueryHint: return 13;
-        case CompletionKind::BuiltinFunction: return 14;
-        case CompletionKind::Schema: return 15;
-        case CompletionKind::Database: return 16;
-        case CompletionKind::Keyword: return 17;
+        case CompletionKind::Parameter: return 0;
+        case CompletionKind::Column: return 1;
+        case CompletionKind::Alias: return 2;
+        case CompletionKind::Cte: return 3;
+        case CompletionKind::TempTable: return 4;
+        case CompletionKind::TableVariable: return 5;
+        case CompletionKind::Table: return 6;
+        case CompletionKind::View: return 7;
+        case CompletionKind::TableFunction: return 8;
+        case CompletionKind::Synonym: return 9;
+        case CompletionKind::Procedure: return 10;
+        case CompletionKind::Variable: return 11;
+        case CompletionKind::ScalarFunction: return 12;
+        case CompletionKind::DataType: return 13;
+        case CompletionKind::UserType: return 14;
+        case CompletionKind::TableHint: return 15;
+        case CompletionKind::QueryHint: return 16;
+        case CompletionKind::BuiltinFunction: return 17;
+        case CompletionKind::Schema: return 18;
+        case CompletionKind::Database: return 19;
+        case CompletionKind::Keyword: return 20;
     }
-    return 18;
+    return 21;
 }
 
 class ItemList {
@@ -395,7 +497,8 @@ public:
         std::stable_sort(items_.begin(), items_.end(), [](const Entry& a, const Entry& b) {
             const int ra = KindRank(a.item.kind), rb = KindRank(b.item.kind);
             if (ra != rb) return ra < rb;
-            if (a.item.kind == CompletionKind::Column) return a.order < b.order;   // definition order
+            if (a.item.kind == CompletionKind::Column || a.item.kind == CompletionKind::Parameter)
+                return a.order < b.order;   // definition order
             const std::string la = Upper(a.item.label), lb = Upper(b.item.label);
             if (la != lb) return la < lb;
             return a.order < b.order;
@@ -436,21 +539,44 @@ CompletionKind KindOfObject(CatalogObject::Type t) {
         case CatalogObject::Type::ScalarFunction: return CompletionKind::ScalarFunction;
         case CatalogObject::Type::TableFunction: return CompletionKind::TableFunction;
         case CatalogObject::Type::Procedure: return CompletionKind::Procedure;
+        case CatalogObject::Type::Synonym: return CompletionKind::Synonym;
     }
     return CompletionKind::Table;
 }
 
-std::string ObjectDetail(const CatalogObject& o) {
-    std::string d = o.database + "." + o.schema;
-    switch (o.type) {
-        case CatalogObject::Type::Table: return "table " + d;
-        case CatalogObject::Type::View: return "view " + d;
-        case CatalogObject::Type::ScalarFunction: return "scalar function " + d;
-        case CatalogObject::Type::TableFunction: return "table-valued function " + d;
-        case CatalogObject::Type::Procedure: return "procedure " + d;
-    }
+/// An EXEC argument's parameter: `<type>[ OUTPUT][ = default]`.
+std::string ParameterDetail(const CatalogParameter& p) {
+    std::string d = p.type;
+    if (p.output) d += " OUTPUT";
+    if (p.hasDefault) d += " = default";
     return d;
 }
+
+/// `kind db.schema`; procedures and functions add their signature: `name(@p type, ...)`.
+std::string ObjectDetail(const CatalogObject& o) {
+    const std::string where = o.database.empty() ? o.schema : o.database + "." + o.schema;
+    auto signature = [&]() {
+        std::string s = " " + QuoteName(o.name) + "(";
+        for (size_t i = 0; i < o.parameters.size(); ++i) {
+            if (i > 0) s += ", ";
+            s += o.parameters[i].name + " " + ParameterDetail(o.parameters[i]);
+        }
+        return s + ")";
+    };
+    switch (o.type) {
+        case CatalogObject::Type::Table: return "table " + where;
+        case CatalogObject::Type::View: return "view " + where;
+        case CatalogObject::Type::ScalarFunction: return "scalar function " + where + signature();
+        case CatalogObject::Type::TableFunction: return "table-valued function " + where + signature();
+        case CatalogObject::Type::Procedure: return "procedure " + where + signature();
+        case CatalogObject::Type::Synonym: return "synonym " + where + " for " + o.target;
+    }
+    return where;
+}
+
+/// Which synonyms an object list includes: those whose target is of the listed types, and with
+/// `Unresolved` also those whose target the catalog does not have.
+enum class Synonyms { None, Resolved, Unresolved };
 
 class ItemBuilder {
 public:
@@ -472,12 +598,54 @@ public:
             for (const SourceInfo& s : sources) Columns(s.columns, s.exposed);
     }
 
-    /// Catalog objects of `types` in database/schema.
-    void Objects(const std::string& db, const std::string& schema, std::initializer_list<CatalogObject::Type> types) {
+    /// Catalog objects of `types` in database/schema (system objects are in every database). Listing
+    /// Synonym in `types` lists every synonym; otherwise `synonyms` selects them by their targets.
+    void Objects(const std::string& db, const std::string& schema, const std::vector<CatalogObject::Type>& types,
+                 Synonyms synonyms) {
+        auto listed = [&](CatalogObject::Type t) { return std::find(types.begin(), types.end(), t) != types.end(); };
         for (const CatalogObject& o : catalog_.objects) {
-            if (!EqualsI(o.database, db) || !EqualsI(o.schema, schema)) continue;
-            if (std::find(types.begin(), types.end(), o.type) == types.end()) continue;
+            if (!InDatabase(o.database, db) || !EqualsI(o.schema, schema)) continue;
+            if (o.type == CatalogObject::Type::Synonym && !listed(o.type)) {
+                if (synonyms == Synonyms::None) continue;
+                const CatalogObject* target = SynonymTarget(catalog_, o);
+                if (target != nullptr ? !listed(target->type) : synonyms != Synonyms::Unresolved) continue;
+            } else if (!listed(o.type)) {
+                continue;
+            }
             items_.Name(KindOfObject(o.type), o.name, ObjectDetail(o));
+        }
+    }
+
+    /// User-defined types named by `parts` (the qualifier) in a data type; table types with `tables`.
+    void UserTypes(const std::vector<std::string>& parts, bool tables) {
+        if (parts.size() > 2) return;
+        const std::string& db = parts.size() == 2 && !parts[0].empty() ? parts[0] : scope_.CurrentDatabase();
+        std::vector<std::string> schemas;
+        if (!parts.empty()) {
+            schemas.push_back(parts.back().empty() ? catalog_.defaultSchema : parts.back());
+        } else {
+            schemas = {catalog_.defaultSchema, "dbo", "sys"};   // where unqualified type names resolve
+        }
+        for (const CatalogType& ty : catalog_.types) {
+            if (!InDatabase(ty.database, db) || (ty.isTableType && !tables)) continue;
+            if (std::none_of(schemas.begin(), schemas.end(), [&](const std::string& s) { return EqualsI(s, ty.schema); }))
+                continue;
+            const std::string where = ty.database.empty() ? ty.schema : ty.database + "." + ty.schema;
+            items_.Name(CompletionKind::UserType, ty.name, (ty.isTableType ? "table type " : "user type ") + where);
+        }
+    }
+
+    /// Parameters of the procedure or function `parts` names that an EXEC argument can still name:
+    /// those after the first `positional` and not in `named`.
+    void Parameters(const std::vector<std::string>& parts, size_t positional, const std::vector<std::string>& named) {
+        const CatalogObject* o = scope_.FindObject(parts);
+        if (o != nullptr && o->type == CatalogObject::Type::Synonym) o = SynonymTarget(catalog_, *o);
+        if (o == nullptr) return;
+        for (size_t i = positional; i < o->parameters.size(); ++i) {
+            const CatalogParameter& p = o->parameters[i];
+            if (std::any_of(named.begin(), named.end(), [&](const std::string& n) { return EqualsI(n, p.name); }))
+                continue;
+            items_.Add(CompletionKind::Parameter, p.name, p.name + " = ", ParameterDetail(p));
         }
     }
 
@@ -491,7 +659,8 @@ public:
 
     void Schemas(const std::string& db) {
         for (const CatalogObject& o : catalog_.objects)
-            if (EqualsI(o.database, db)) items_.Name(CompletionKind::Schema, o.schema, "schema in " + o.database);
+            if (InDatabase(o.database, db))
+                items_.Name(CompletionKind::Schema, o.schema, o.database.empty() ? "system schema" : "schema in " + o.database);
     }
 
     void Databases() {
@@ -499,11 +668,11 @@ public:
     }
 
     /// FROM / target / EXEC names: `parts` is the qualifier typed before the caret word.
-    void ObjectNames(const std::vector<std::string>& parts, std::initializer_list<CatalogObject::Type> types,
-                     bool scriptObjects) {
+    void ObjectNames(const std::vector<std::string>& parts, const std::vector<CatalogObject::Type>& types,
+                     Synonyms synonyms, bool scriptObjects) {
         const std::string& db = scope_.CurrentDatabase();
         if (parts.empty()) {
-            Objects(db, catalog_.defaultSchema, types);
+            Objects(db, catalog_.defaultSchema, types, synonyms);
             if (scriptObjects) {
                 for (const CteInfo& c : scope_.Ctes()) items_.Name(CompletionKind::Cte, c.name, "common table expression");
                 for (const TempTableInfo& t : scope_.TempTables()) items_.Name(CompletionKind::TempTable, t.name, "temp table");
@@ -513,13 +682,13 @@ public:
             return;
         }
         if (parts.size() == 1) {
-            Objects(db, parts[0], types);
+            Objects(db, parts[0], types, synonyms);
             if (IsDatabase(parts[0])) Schemas(parts[0]);
             return;
         }
         // db.schema. / db.. / server.db.schema.
         const std::string& d = parts[parts.size() - 2];
-        Objects(d.empty() ? db : d, parts.back().empty() ? catalog_.defaultSchema : parts.back(), types);
+        Objects(d.empty() ? db : d, parts.back().empty() ? catalog_.defaultSchema : parts.back(), types, synonyms);
     }
 
     /// Expression names; `parts` is the qualifier.
@@ -548,7 +717,7 @@ public:
                 }
             }
             if (!found) {
-                Objects(scope_.CurrentDatabase(), parts[0], {CatalogObject::Type::ScalarFunction});
+                Objects(scope_.CurrentDatabase(), parts[0], {CatalogObject::Type::ScalarFunction}, Synonyms::Resolved);
                 if (IsDatabase(parts[0])) Schemas(parts[0]);
             }
             return;
@@ -565,12 +734,14 @@ public:
         }
         if (!found && parts.size() == 2)
             Objects(parts[0].empty() ? scope_.CurrentDatabase() : parts[0],
-                    parts[1].empty() ? catalog_.defaultSchema : parts[1], {CatalogObject::Type::ScalarFunction});
+                    parts[1].empty() ? catalog_.defaultSchema : parts[1], {CatalogObject::Type::ScalarFunction},
+                    Synonyms::Resolved);
     }
 
     void Variables(bool tables, bool scalars, bool globals) {
         for (const VariableInfo& v : scope_.Variables()) {
-            if (v.isTable && tables) items_.Add(CompletionKind::TableVariable, v.name, v.name, "table variable");
+            if (v.isTable && tables)
+                items_.Add(CompletionKind::TableVariable, v.name, v.name, v.tableType != nullptr ? v.type : "table variable");
             if (!v.isTable && scalars) items_.Add(CompletionKind::Variable, v.name, v.name, v.type);
         }
         if (globals)
@@ -613,6 +784,8 @@ private:
 
 struct WalkResult {
     size_t statementIndex = SIZE_MAX;   // parser-token index where the caret's statement starts
+    bool atCaret = false;               // the parser stood at the caret (the walk crossed no tokens)
+    bool emitted = false;               // the walk found candidates (classified or not)
 };
 
 /// FIRST set of a rule (cached: the analysis of `statement` visits much of the grammar).
@@ -625,32 +798,44 @@ const antlr4::misc::IntervalSet& FirstSet(const Grammar& g, size_t rule) {
     return it->second;
 }
 
-WalkResult WalkCaret(const Grammar& g, const CaretParse& ps, Contexts& ctx, Contexts& functionArgs) {
+WalkResult WalkCaret(const Grammar& g, CaretSession& session, Contexts& ctx, Contexts& functionArgs) {
     WalkResult r;
+    const CaretParse& ps = session.result;
     const Capture& cap = ps.capture;
     if (!cap.captured) return r;
     CandidateClassifier classifier(g, ctx, functionArgs);
-    auto run = [&](int state, size_t index, const std::vector<int>& follow, size_t budget) {
+    // `locals`: the capture the walk starts at (its rule locals), null for a statement-start walk
+    auto run = [&](int state, size_t index, const std::vector<int>& follow, size_t budget, const Capture* locals,
+                   int pending = -1) {
         WalkInput in;
         in.tokens = &ps.tokens;
         in.upper = &ps.upper;
         in.startState = state;
         in.startIndex = index;
         in.outerFollow = follow;
+        in.startPending = pending;
         in.caret = ps.tokens.size();
         in.budget = budget;
-        return Walk(g, in, [&](const WalkCandidate& c) { classifier.Add(c); }).emitted > 0;
+        in.evaluate = [&session, locals](size_t rule, size_t pred, size_t at, bool live) {
+            return session.EvaluatePredicate(rule, pred, at, live ? locals : nullptr);
+        };
+        const bool any = Walk(g, in, [&](const WalkCandidate& c) { classifier.Add(c); }).emitted > 0;
+        r.emitted = r.emitted || any;
+        return any;
     };
-    // a decision whose opaque predicate looked at the caret: its alternatives as well
-    if (ps.early.captured && !ps.early.errorInStatement) run(ps.early.state, ps.early.index, ps.early.follow, 200'000);
+    // a decision whose opaque predicate looked at the caret: its alternatives as well (the parse
+    // went on after it, so its context's locals are not those of the decision any more)
+    if (ps.early.captured && !ps.early.errorInStatement)
+        run(ps.early.state, ps.early.index, ps.early.follow, 200'000, nullptr, ps.early.pendingCall);
     if (!cap.errorInStatement) {
-        run(cap.state, cap.index, cap.follow, 400'000);
+        run(cap.state, cap.index, cap.follow, 400'000, &cap, cap.pendingCall);
         r.statementIndex = cap.statementState >= 0 ? cap.statementIndex : SIZE_MAX;
+        r.atCaret = cap.index == ps.tokens.size();
         return r;
     }
     // a syntax error earlier in the caret's statement: walk the statement from its start, else from
     // the first later points where a statement can start
-    if (run(cap.statementState, cap.statementIndex, cap.statementFollow, 200'000)) {
+    if (run(cap.statementState, cap.statementIndex, cap.statementFollow, 200'000, nullptr)) {
         r.statementIndex = cap.statementIndex;
         return r;
     }
@@ -663,7 +848,7 @@ WalkResult WalkCaret(const Grammar& g, const CaretParse& ps, Contexts& ctx, Cont
                                   first.contains(static_cast<ssize_t>(ps.tokens[p].type));
         if (!afterSemicolon && !keywordStart && p != ps.tokens.size()) continue;
         ++tries;
-        if (run(cap.statementState, p, cap.statementFollow, 50'000)) {
+        if (run(cap.statementState, p, cap.statementFollow, 50'000, nullptr)) {
             r.statementIndex = p;
             return r;
         }
@@ -685,6 +870,124 @@ void FallbackContexts(const ScriptTokens& t, size_t caretTok, Contexts& ctx) {
     } else {
         ctx.expression = ctx.builtinFunctions = ctx.scalarVariables = true;
     }
+}
+
+/// The caret right after the name of a column being defined, with no data type yet (a table's
+/// column list: TABLE name ( ..., or ALTER TABLE ... ADD): only a data type or AS (a computed
+/// column) follows; anything else fails VerifyColumnDataType unless the column is named timestamp.
+/// (PERIOD there may also begin PERIOD FOR SYSTEM_TIME: kPeriod keywords stay.)
+bool ColumnWithoutType(const ScriptTokens& t, size_t caretTok) {
+    if (caretTok < 2 || !t.IsName(caretTok - 1)) return false;
+    if (EqualsI(t.Name(caretTok - 1), "TIMESTAMP")) return false;
+    const size_t k = caretTok - 2;
+    if (t.Is(k, "ADD")) return true;
+    if (t.Type(k) != Ty(T::LeftParenthesis) && t.Type(k) != Ty(T::Comma)) return false;
+    // the parenthesis the column is in, or the ADD of ALTER TABLE ... ADD c1 int, c2
+    size_t depth = 0;
+    for (size_t i = k + 1; i-- > 0;) {
+        const uint32_t type = t.Type(i);
+        if (type == Ty(T::RightParenthesis)) {
+            ++depth;
+        } else if (type == Ty(T::LeftParenthesis)) {
+            if (depth-- > 0) continue;
+            // TABLE ( (a table variable or type, RETURNS @t TABLE), TABLE name (
+            size_t j = i;
+            while (j > 0 && (t.IsName(j - 1) || t.Type(j - 1) == Ty(T::Dot))) --j;
+            return j > 0 && t.Type(j - 1) == Ty(T::Table);
+        } else if (depth == 0 && (type == Ty(T::Semicolon) || type == Ty(T::Go))) {
+            return false;
+        } else if (depth == 0 && t.Is(i, "ADD")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether `text` parses up to its end (a trial parse; the parser stops when it reaches the end).
+bool TextParses(const Grammar& g, const std::string& text) {
+    Buffer scratch(g);
+    scratch.SetText(text);
+    const auto session = g.ParseToCaret(scratch.View(), ResumePoint{}, scratch.Tokens().size());
+    return session->result.capture.captured && !session->result.syntaxErrors;
+}
+
+/// Whether the statement before byte `end` can end there: the text from `start` (where the caret's
+/// statement starts) to `end`, followed by a statement, parses. (The grammar lets many statements
+/// end where an action then requires more, e.g. ALTER MESSAGE TYPE ... VALIDATION = VALID_XML
+/// needs WITH SCHEMA COLLECTION.)
+bool StatementCanEnd(const Grammar& g, std::string_view sql, size_t start, size_t end) {
+    return TextParses(g, std::string(sql.substr(start, end - start)) + "\nDECLARE ");
+}
+
+/// Keywords at the caret after a comma that repeat a word of the caret's statement: those that the
+/// statement's text from `start` to `end` cannot be followed by (an option given twice: actions
+/// call CheckOptionDuplication or throw SQL46049 on the option word). At most `limit` trials.
+std::vector<std::string> RepeatedKeywordsRejected(const Grammar& g, std::string_view sql, const ScriptTokens& t,
+                                                  size_t first, size_t caretTok, size_t start, size_t end,
+                                                  const std::vector<std::pair<std::string, CompletionKind>>& keywords) {
+    std::vector<std::string> rejected;
+    if (caretTok == 0 || t.Type(caretTok - 1) != Ty(T::Comma)) return rejected;
+    std::set<std::string> words;
+    for (size_t i = first; i < caretTok; ++i)
+        if (t.IsName(i)) words.insert(Upper(t.Name(i)));
+        else if (KeywordText(t.Type(i)) != nullptr) words.insert(Upper(t.Text(i)));
+    constexpr size_t limit = 16;
+    size_t trials = 0;
+    const std::string text(sql.substr(start, end - start));
+    for (const auto& [word, kind] : keywords) {
+        if (words.count(word) == 0) continue;
+        if (trials++ == limit) break;
+        if (!TextParses(g, text + word + " ")) rejected.push_back(word);
+    }
+    return rejected;
+}
+
+/// An EXEC call whose argument list the caret starts an argument of.
+struct ExecCall {
+    std::vector<std::string> procedure;   // the name as written
+    size_t positional = 0;                // arguments before the caret without `@name =`
+    std::vector<std::string> named;       // the @names of those with it
+    bool afterComma = false;              // not the first argument
+};
+
+bool FindExecCall(const ScriptTokens& t, size_t caretTok, ExecCall& out) {
+    if (caretTok == 0) return false;
+    size_t exec = SIZE_MAX, depth = 0;
+    for (size_t i = StatementStartFromTokens(t, caretTok - 1); i < caretTok; ++i) {
+        const uint32_t type = t.Type(i);
+        if (type == Ty(T::LeftParenthesis)) ++depth;
+        else if (type == Ty(T::RightParenthesis) && depth > 0) --depth;
+        else if (depth == 0 && OneOf(type, {T::Exec, T::Execute})) exec = i;
+    }
+    if (exec == SIZE_MAX) return false;
+    size_t i = exec + 1;
+    if (t.Type(i) == Ty(T::Variable) && t.Type(i + 1) == Ty(T::EqualsSign)) i += 2;   // EXEC @status = name
+    out.procedure.clear();
+    while (i < caretTok) {
+        if (t.IsName(i)) out.procedure.push_back(t.Name(i++));
+        else if (t.Type(i) == Ty(T::Dot)) out.procedure.emplace_back();
+        else break;
+        if (t.Type(i) != Ty(T::Dot)) break;
+        ++i;
+    }
+    if (out.procedure.empty() || i > caretTok || t.Type(i - 1) == Ty(T::Dot)) return false;
+    if (t.Type(i) == Ty(T::Semicolon) && t.Type(i + 1) == Ty(T::Integer) && i + 2 <= caretTok) i += 2;   // ;number
+    const size_t first = i;
+    size_t a = i;
+    depth = 0;
+    for (size_t k = i; k < caretTok; ++k) {
+        const uint32_t type = t.Type(k);
+        if (type == Ty(T::LeftParenthesis)) ++depth;
+        else if (type == Ty(T::RightParenthesis) && depth > 0) --depth;
+        else if (depth == 0 && type == Ty(T::Semicolon)) return false;
+        else if (depth == 0 && type == Ty(T::Comma)) {
+            if (t.Type(a) == Ty(T::Variable) && t.Type(a + 1) == Ty(T::EqualsSign)) out.named.emplace_back(t.Text(a));
+            else ++out.positional;
+            a = k + 1;
+        }
+    }
+    out.afterComma = a > first;
+    return a == caretTok;
 }
 
 /// SqlScriptDOM's merge-action checks (SQL46040, SQL46041 in insertMergeAction / updateMergeAction /
@@ -724,61 +1027,139 @@ const std::vector<std::string>* SetCommandValues(std::string_view command) {
 
 // ============================================================================================= API
 
-CompletionResult Complete(std::string_view sql, size_t caret, SqlVersion version, const Catalog& catalog) {
-    const Grammar& g = GrammarFor(version);
+namespace detail {
+
+CompletionResult CompleteAt(Buffer& buffer, size_t caret, const Catalog& catalog) {
+    const Grammar& g = buffer.grammar();
+    const SqlVersion version = g.version;
+    const std::string& sql = buffer.Text();
     CompletionResult result;
     caret = std::min(caret, sql.size());
     result.replaceStart = caret;
 
-    std::vector<LexToken> all;
-    g.Lex(sql, all, caret);
+    const std::vector<LexToken>& all = buffer.Tokens();
     const CaretWord word = FindCaretWord(sql, caret, all);
     if (word.none) return result;
     result.replaceStart = word.start;
     result.replaceLength = word.end - word.start;
+
+    // the parser-visible tokens up to the end of the caret's batch (for the scope analysis)
+    const std::vector<LexToken>& visible = buffer.Visible();
+    const LexToken* vis = visible.data();
+    size_t visCount = visible.size();
+    std::vector<LexToken> relexed;
     if (word.quoted) {
         // an unterminated [name at the caret swallowed the text after it: lex that text again
         auto keep = std::find_if(all.begin(), all.end(), [&](const LexToken& t) { return t.end > word.start; });
         if (keep != all.end() && keep->end > caret) {
-            all.erase(keep, all.end());
+            for (auto it = all.begin(); it != keep; ++it)
+                if (!IsHiddenType(it->type)) relexed.push_back(*it);
             std::vector<LexToken> rest;
-            g.Lex(sql.substr(caret), rest, 0);
+            g.Lex(std::string_view(sql).substr(caret), rest);
             for (LexToken t : rest) {
+                if (IsHiddenType(t.type)) continue;
                 t.start += static_cast<uint32_t>(caret);
                 t.end += static_cast<uint32_t>(caret);
-                all.push_back(t);
+                relexed.push_back(t);
+            }
+            vis = relexed.data();
+            visCount = relexed.size();
+        }
+    }
+    const size_t caretTok = static_cast<size_t>(
+        std::lower_bound(vis, vis + visCount, word.start, [](const LexToken& t, size_t o) { return t.start < o; }) - vis);
+    size_t batchEnd = caretTok;
+    while (batchEnd < visCount && !(vis[batchEnd].type == Ty(T::Go) && vis[batchEnd].start >= caret)) ++batchEnd;
+    const ScriptTokens tokens(sql, vis, std::min(visCount, batchEnd + 1));
+
+    // Parse from where the parse of the whole text starts the statement that holds the token before
+    // the caret (a statement or batch boundary of it), so that the parse also offers what continues
+    // that statement; it reads the tokens up to the caret only.
+    const std::vector<uint32_t>& visToTok = buffer.VisibleToToken();
+    auto visibleIndexOf = [&](size_t token) {
+        return static_cast<size_t>(std::lower_bound(visToTok.begin(), visToTok.end(), token) - visToTok.begin());
+    };
+    const size_t limit = buffer.TokenAt(word.start);
+    // the token before the caret (right after a GO: the caret's own, where its batch starts)
+    size_t before = 0;
+    ResumePoint from;
+    if (caretTok > 0) {
+        const size_t own = caretTok < visToTok.size() ? visToTok[caretTok] : buffer.Tokens().size();
+        before = tokens.Type(caretTok - 1) == Ty(T::Go) ? own : visToTok[caretTok - 1];
+        buffer.EnsureParsed(before, before + 1);
+        // a point the text's parse reached only by looking at the caret or past it (a look-ahead
+        // decision that read on) may not be one of the text up to the caret
+        from = buffer.ResumeAtOrBefore(before, limit);
+    }
+    auto parseFrom = [&](const ResumePoint& at) { return g.ParseToCaret(buffer.View(), at, limit); };
+    size_t parseTok = visibleIndexOf(from.token);
+    std::unique_ptr<CaretSession> session = parseFrom(from);
+    {
+        // errors before the caret: past them, start at the statement the tokens suggest
+        const CaretParse& ps = session->result;
+        if (ps.syntaxErrors && ps.firstError < ps.tokens.size() && caretTok > parseTok) {
+            const size_t tail = StatementStartFromTokens(tokens, caretTok - 1, parseTok);
+            if (tail > parseTok + ps.firstError && tail < caretTok) {
+                ResumePoint at;
+                at.kind = ResumePoint::Kind::InBatch;
+                at.firstBatch = from.kind == ResumePoint::Kind::ScriptStart ||
+                                (from.kind == ResumePoint::Kind::InBatch && from.firstBatch);
+                at.quotedIdentifier = from.kind == ResumePoint::Kind::BatchStart || from.quotedIdentifier;
+                at.token = visToTok[tail];
+                auto retry = parseFrom(at);
+                if (retry->result.capture.captured && !(retry->result.syntaxErrors && retry->result.firstError < 3)) {
+                    session = std::move(retry);
+                    parseTok = tail;
+                }
             }
         }
     }
-
-    const ScriptTokens tokens(sql, all);
-    const size_t caretTok = tokens.IndexAt(word.start);
-    const size_t batchTok = tokens.BatchStart(caretTok);
-
-    // Parse from the start of the statement before the caret (found from the tokens; the parse then
-    // also offers what continues that statement; after a ';' nothing does). When the parse fails
-    // right at that start, the tokens misjudged where the statement starts: parse the whole batch.
-    size_t parseTok = batchTok;
-    if (caretTok > batchTok)
-        parseTok = tokens.Type(caretTok - 1) == Ty(T::Semicolon) ? caretTok
-                                                                  : StatementStartFromTokens(tokens, caretTok - 1);
-    if (parseTok < batchTok || parseTok > caretTok) parseTok = batchTok;
-    auto parseFrom = [&](size_t tok) {
-        const size_t from = tok < caretTok ? tokens.At(tok).start : word.start;
-        return g.ParseToCaret(sql.substr(from, word.start - from));
-    };
-    CaretParse ps = parseFrom(parseTok);
-    if (parseTok != batchTok && (!ps.capture.captured || (ps.syntaxErrors && ps.firstError < 3))) {
-        parseTok = batchTok;
-        ps = parseFrom(parseTok);
+    if (from.kind == ResumePoint::Kind::InBatch && caretTok > 0) {
+        // the parse fails right at the statement start: parse the whole batch
+        const CaretParse& ps = session->result;
+        if (!ps.capture.captured || (ps.syntaxErrors && ps.firstError < 3)) {
+            const ResumePoint batch = buffer.BatchResumeAtOrBefore(before);
+            auto retry = parseFrom(batch);
+            if (retry->result.capture.captured) {
+                session = std::move(retry);
+                parseTok = visibleIndexOf(batch.token);
+            }
+        }
     }
+    const CaretParse& ps = session->result;
 
     Contexts ctx, functionArgs;
-    const WalkResult walk = WalkCaret(g, ps, ctx, functionArgs);
+    const WalkResult walk = WalkCaret(g, *session, ctx, functionArgs);
     const bool aligned = caretTok - parseTok == ps.tokens.size();
-    if (!ctx.Any() && !functionArgs.Any()) FallbackContexts(tokens, caretTok, ctx);
-    const size_t statementStart =
+    if (!walk.emitted && !ctx.Any() && !functionArgs.Any()) FallbackContexts(tokens, caretTok, ctx);
+    if (ColumnWithoutType(tokens, caretTok))
+        ctx.DropKeywords([](uint8_t paths) { return !(paths & (kColumnStart | kPeriod)); });
+    // trial parses of the caret's statement start where the parser's innermost statement does (inside a
+    // block, IF, a module body: the inner statement, which parses on its own)
+    const size_t parserStatement =
         aligned && walk.statementIndex != SIZE_MAX ? parseTok + walk.statementIndex : SIZE_MAX;
+    const size_t trialTok = parserStatement != SIZE_MAX && parserStatement < caretTok ? parserStatement : parseTok;
+    size_t statementStart = parserStatement;
+    // the parser stood before the caret, in a compound statement (a look-ahead decision of BEGIN,
+    // IF, ... that read up to the caret): the statement in it that holds the caret, from the tokens
+    if (statementStart != SIZE_MAX && !walk.atCaret && caretTok > statementStart &&
+        OneOf(tokens.Type(statementStart), {T::Begin, T::If, T::While, T::Else, T::Create, T::Alter}))
+        statementStart = StatementStartFromTokens(tokens, caretTok - 1, statementStart);
+    // statements after the caret's (in its batch or its block): only when that statement can end at the caret
+    if (trialTok < caretTok && ctx.AnyKeywordOnly(kAfterStatement | kColumnStart) &&
+        !StatementCanEnd(g, sql, tokens.At(trialTok).start, word.start))
+        ctx.DropKeywords([](uint8_t paths) { return !(paths & kInStatement); });
+    if (trialTok < caretTok) {
+        const std::vector<std::string> rejected =
+            RepeatedKeywordsRejected(g, sql, tokens, trialTok, caretTok, tokens.At(trialTok).start, word.start, ctx.keywords);
+        if (!rejected.empty())
+            ctx.keywords.erase(std::remove_if(ctx.keywords.begin(), ctx.keywords.end(),
+                                              [&](const auto& k) {
+                                                  return std::find(rejected.begin(), rejected.end(), k.first) !=
+                                                         rejected.end();
+                                              }),
+                               ctx.keywords.end());
+    }
     const ScopeAnalyzer scope(tokens, catalog, caretTok, statementStart);
     const std::vector<std::string> qualifier = Qualifier(tokens, caretTok);
     if (functionArgs.Any()) {
@@ -792,9 +1173,18 @@ CompletionResult Complete(std::string_view sql, size_t caret, SqlVersion version
     ItemBuilder build(catalog, version, scope, items);
     using OT = CatalogObject::Type;
 
-    if (ctx.expression || ctx.targetColumns) {
+    ExecCall call;
+    if (ctx.execParameters && qualifier.empty() && FindExecCall(tokens, caretTok, call)) {
+        build.Parameters(call.procedure, call.positional, call.named);
+        if (call.afterComma && !call.named.empty()) {
+            // after an argument with @name = every argument needs it (SQL46089): no bare values
+            ctx.expression = ctx.builtinFunctions = ctx.scalarVariables = false;
+            ctx.keywords.clear();
+        }
+    }
+    if (ctx.expression || ctx.targetColumns || ctx.sourceColumns) {
         const std::vector<SourceInfo> sources = scope.ExpressionSources();
-        if (ctx.expression) build.ExpressionNames(qualifier, false, sources);
+        if (ctx.expression || ctx.sourceColumns) build.ExpressionNames(qualifier, false, sources);
         if (ctx.targetColumns) build.ExpressionNames(qualifier, qualifier.empty(), sources);
         if (ctx.orderBy && qualifier.empty()) build.Columns(scope.SelectListNames(), "select list");
     }
@@ -813,16 +1203,34 @@ CompletionResult Complete(std::string_view sql, size_t caret, SqlVersion version
             }
         }
     }
+    if (ctx.dataType) build.UserTypes(qualifier, ctx.tableTypes);
     if (ctx.tableSource) {
-        build.ObjectNames(qualifier, {OT::Table, OT::View, OT::TableFunction}, true);
+        build.ObjectNames(qualifier, {OT::Table, OT::View, OT::TableFunction}, Synonyms::Unresolved, true);
         if (qualifier.empty()) build.TableFunctions();
     }
     if (ctx.dmlTarget) {
-        build.ObjectNames(qualifier, {OT::Table, OT::View}, true);
+        build.ObjectNames(qualifier, {OT::Table, OT::View}, Synonyms::Resolved, true);
         if (qualifier.empty()) build.Sources(scope.TargetFromSources(), false);
     }
-    if (ctx.objectTarget) build.ObjectNames(qualifier, {OT::Table, OT::View}, true);
-    if (ctx.procedure) build.ObjectNames(qualifier, {OT::Procedure}, false);
+    if (ctx.objectTarget) build.ObjectNames(qualifier, {OT::Table, OT::View}, Synonyms::None, true);
+    if (ctx.procedure) {
+        build.ObjectNames(qualifier, {OT::Procedure}, Synonyms::Unresolved, false);
+        // unqualified sp_ and xp_ names resolve to the system procedures as well
+        if (qualifier.empty() && (StartsWithI(word.typed, "sp_") || StartsWithI(word.typed, "xp_")))
+            build.Objects(scope.CurrentDatabase(), "sys", {OT::Procedure}, Synonyms::None);
+    }
+    if (ctx.dropTypes != 0) {
+        std::vector<OT> types;
+        for (OT t : {OT::Table, OT::View, OT::ScalarFunction, OT::TableFunction, OT::Procedure, OT::Synonym})
+            if (ctx.dropTypes & (1u << static_cast<unsigned>(t))) types.push_back(t);
+        build.ObjectNames(qualifier, types, Synonyms::None, (ctx.dropTypes & (1u << static_cast<unsigned>(OT::Table))) != 0);
+    }
+    if (ctx.selectIntoOn && qualifier.empty()) {
+        // SELECT ... INTO name | ON filegroup
+        size_t i = caretTok;
+        while (i > 0 && (tokens.IsName(i - 1) || tokens.Type(i - 1) == Ty(T::Dot))) --i;
+        if (i < caretTok && i > 0 && tokens.Type(i - 1) == Ty(T::Into)) ctx.AddKeyword("ON", CompletionKind::Keyword);
+    }
     if (ctx.setCommandValue && qualifier.empty() && caretTok > 0)
         if (const auto* values = SetCommandValues(tokens.Text(caretTok - 1)))
             for (const std::string& v : *values) items.Add(CompletionKind::Keyword, v, v);
@@ -835,5 +1243,7 @@ CompletionResult Complete(std::string_view sql, size_t caret, SqlVersion version
     result.items = items.Take();
     return result;
 }
+
+}  // namespace detail
 
 }  // namespace tsql::editor

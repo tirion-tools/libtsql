@@ -3,8 +3,16 @@
     "Fixture catalog for tests/editor (tsql::editor::Catalog). A small performance-tuning shaped schema:",
     "several databases and schemas, names that need quoting (spaces, reserved words, ']' inside, leading digit),",
     "a non-ASCII name that needs no quoting (Umsätze; UTF-8 offsets),",
-    "views, scalar and table-valued functions, procedures. columns: [name, type] pairs; only tables,",
-    "views and table functions have columns. Changing names here affects completion_cases.json."
+    "views, scalar and table-valued functions, procedures, synonyms, user-defined types.",
+    "objects: {database, schema, name, type, columns, parameters, target}. columns: [name, type] pairs; only tables,",
+    "views and table functions have columns. parameters (procedures and functions only, declaration order):",
+    "[name, type, flag...] with name including '@' and flags 'output' (OUTPUT parameter) and 'default' (has a",
+    "default). target (synonyms only, required): the multi-part name the synonym stands for.",
+    "An empty database means a system object present in every database (sys.*, INFORMATION_SCHEMA.*), as Calliper",
+    "fills them from sys.all_objects / sys.all_columns / sys.all_parameters; the system objects below use their",
+    "real column and parameter names (a subset of the columns).",
+    "types: {database, schema, name, isTableType, columns}: alias types (no columns) and table types (columns);",
+    "empty database = every database. Changing names here affects completion_cases.json."
   ],
   "currentDatabase": "SalesDb",
   "defaultSchema": "dbo",
@@ -26,11 +34,24 @@
       ["GroupID", "int"], ["Key", "nvarchar(50)"], ["Order", "int"], ["Name", "nvarchar(100)"]]},
     {"database": "SalesDb", "schema": "dbo", "name": "vw_OrderSummary", "type": "View", "columns": [
       ["OrderID", "int"], ["CustomerName", "nvarchar(100)"], ["OrderTotal", "money"], ["LineCount", "int"]]},
-    {"database": "SalesDb", "schema": "dbo", "name": "fn_OrderTotal", "type": "ScalarFunction", "columns": []},
+    {"database": "SalesDb", "schema": "dbo", "name": "fn_OrderTotal", "type": "ScalarFunction",
+     "parameters": [["@OrderID", "int"]]},
     {"database": "SalesDb", "schema": "dbo", "name": "fn_OrdersByCustomer", "type": "TableFunction", "columns": [
-      ["OrderID", "int"], ["OrderDate", "datetime2(3)"], ["TotalDue", "money"]]},
-    {"database": "SalesDb", "schema": "dbo", "name": "usp_GetOrders", "type": "Procedure", "columns": []},
-    {"database": "SalesDb", "schema": "dbo", "name": "usp_RefreshStats", "type": "Procedure", "columns": []},
+      ["OrderID", "int"], ["OrderDate", "datetime2(3)"], ["TotalDue", "money"]],
+     "parameters": [["@CustomerID", "int"], ["@Since", "date", "default"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "usp_GetOrders", "type": "Procedure",
+     "parameters": [["@CustomerID", "int"], ["@Since", "date", "default"], ["@Status", "tinyint", "default"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "usp_RefreshStats", "type": "Procedure",
+     "parameters": [["@TableName", "sysname"], ["@SamplePercent", "int", "default"], ["@RowCount", "int", "output"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "usp_PurgeCache", "type": "Procedure"},
+    {"database": "SalesDb", "schema": "dbo", "name": "usp_LoadOrders", "type": "Procedure",
+     "parameters": [["@Orders", "dbo.OrderIdList"], ["@Contact", "dbo.Phone", "default"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "syn_Orders", "type": "Synonym", "target": "dbo.Orders"},
+    {"database": "SalesDb", "schema": "dbo", "name": "syn_Summary", "type": "Synonym", "target": "SalesDb.dbo.vw_OrderSummary"},
+    {"database": "SalesDb", "schema": "dbo", "name": "syn_CustomerOrders", "type": "Synonym", "target": "dbo.fn_OrdersByCustomer"},
+    {"database": "SalesDb", "schema": "dbo", "name": "syn_Stock", "type": "Synonym", "target": "Warehouse.dbo.StockLevels"},
+    {"database": "SalesDb", "schema": "dbo", "name": "syn_Restock", "type": "Synonym", "target": "Warehouse.dbo.usp_Restock"},
+    {"database": "SalesDb", "schema": "dbo", "name": "syn_Remote", "type": "Synonym", "target": "LinkedSrv.Archive.dbo.OldOrders"},
     {"database": "SalesDb", "schema": "sales", "name": "Invoices", "type": "Table", "columns": [
       ["InvoiceID", "int"], ["OrderID", "int"], ["InvoiceDate", "date"], ["Amount", "money"],
       ["PaidAt", "datetime2(0)"]]},
@@ -38,8 +59,11 @@
       ["SalesPersonID", "int"], ["FullName", "nvarchar(100)"], ["Territory", "nvarchar(50)"], ["Quota", "money"]]},
     {"database": "SalesDb", "schema": "sales", "name": "vw_TopCustomers", "type": "View", "columns": [
       ["CustomerID", "int"], ["CustomerName", "nvarchar(100)"], ["Revenue", "money"]]},
-    {"database": "SalesDb", "schema": "sales", "name": "fn_Commission", "type": "ScalarFunction", "columns": []},
-    {"database": "SalesDb", "schema": "sales", "name": "usp_CloseInvoice", "type": "Procedure", "columns": []},
+    {"database": "SalesDb", "schema": "sales", "name": "fn_Commission", "type": "ScalarFunction",
+     "parameters": [["@SalesPersonID", "int"], ["@Rate", "decimal(5,4)", "default"]]},
+    {"database": "SalesDb", "schema": "sales", "name": "usp_CloseInvoice", "type": "Procedure",
+     "parameters": [["@InvoiceID", "int"], ["@ClosedAt", "datetime2(0)", "default"], ["@Message", "nvarchar(200)", "output", "default"]]},
+    {"database": "SalesDb", "schema": "sales", "name": "syn_People", "type": "Synonym", "target": "sales.SalesPeople"},
     {"database": "SalesDb", "schema": "hr", "name": "Employees", "type": "Table", "columns": [
       ["EmployeeID", "int"], ["ManagerID", "int"], ["FullName", "nvarchar(100)"], ["HireDate", "date"],
       ["Title", "nvarchar(50)"]]},
@@ -50,7 +74,9 @@
       ["ProductID", "int"], ["WarehouseID", "int"], ["OnHand", "int"], ["ReorderPoint", "int"]]},
     {"database": "Warehouse", "schema": "dbo", "name": "vw_LowStock", "type": "View", "columns": [
       ["ProductID", "int"], ["OnHand", "int"]]},
-    {"database": "Warehouse", "schema": "dbo", "name": "usp_Restock", "type": "Procedure", "columns": []},
+    {"database": "Warehouse", "schema": "dbo", "name": "usp_Restock", "type": "Procedure",
+     "parameters": [["@ProductID", "int"], ["@WarehouseID", "int"], ["@Quantity", "int"]]},
+    {"database": "Warehouse", "schema": "dbo", "name": "syn_SalesOrders", "type": "Synonym", "target": "SalesDb.dbo.Orders"},
     {"database": "Warehouse", "schema": "inv", "name": "Bins", "type": "Table", "columns": [
       ["BinID", "int"], ["WarehouseID", "int"], ["Aisle", "nvarchar(10)"]]},
     {"database": "Reporting", "schema": "dbo", "name": "DailySales", "type": "Table", "columns": [
@@ -60,6 +86,120 @@
     {"database": "Reporting", "schema": "dbo", "name": "Umsätze", "type": "Table", "columns": [
       ["Jahr", "int"], ["Betrag", "money"]]},
     {"database": "Sales-Archive", "schema": "dbo", "name": "OrdersArchive", "type": "Table", "columns": [
-      ["OrderID", "int"], ["ArchivedAt", "datetime2"]]}
+      ["OrderID", "int"], ["ArchivedAt", "datetime2"]]},
+
+    {"database": "", "schema": "sys", "name": "dm_exec_query_stats", "type": "View", "columns": [
+      ["sql_handle", "varbinary(64)"], ["statement_start_offset", "int"], ["statement_end_offset", "int"],
+      ["plan_generation_num", "bigint"], ["plan_handle", "varbinary(64)"], ["creation_time", "datetime"],
+      ["last_execution_time", "datetime"], ["execution_count", "bigint"], ["total_worker_time", "bigint"],
+      ["last_worker_time", "bigint"], ["min_worker_time", "bigint"], ["max_worker_time", "bigint"],
+      ["total_physical_reads", "bigint"], ["total_logical_writes", "bigint"], ["total_logical_reads", "bigint"],
+      ["last_logical_reads", "bigint"], ["total_elapsed_time", "bigint"], ["last_elapsed_time", "bigint"],
+      ["max_elapsed_time", "bigint"], ["query_hash", "binary(8)"], ["query_plan_hash", "binary(8)"],
+      ["total_rows", "bigint"], ["total_grant_kb", "bigint"], ["total_spills", "bigint"]]},
+    {"database": "", "schema": "sys", "name": "dm_exec_sql_text", "type": "TableFunction", "columns": [
+      ["dbid", "smallint"], ["objectid", "int"], ["number", "smallint"], ["encrypted", "bit"], ["text", "nvarchar(max)"]],
+     "parameters": [["@handle", "varbinary(64)"]]},
+    {"database": "", "schema": "sys", "name": "dm_exec_query_plan", "type": "TableFunction", "columns": [
+      ["dbid", "smallint"], ["objectid", "int"], ["number", "smallint"], ["encrypted", "bit"], ["query_plan", "xml"]],
+     "parameters": [["@handle", "varbinary(64)"]]},
+    {"database": "", "schema": "sys", "name": "dm_exec_text_query_plan", "type": "TableFunction", "columns": [
+      ["dbid", "smallint"], ["objectid", "int"], ["number", "smallint"], ["encrypted", "bit"], ["query_plan", "nvarchar(max)"]],
+     "parameters": [["@plan_handle", "varbinary(64)"], ["@statement_start_offset", "int"], ["@statement_end_offset", "int"]]},
+    {"database": "", "schema": "sys", "name": "dm_exec_requests", "type": "View", "columns": [
+      ["session_id", "smallint"], ["request_id", "int"], ["start_time", "datetime"], ["status", "nvarchar(30)"],
+      ["command", "nvarchar(32)"], ["sql_handle", "varbinary(64)"], ["statement_start_offset", "int"],
+      ["statement_end_offset", "int"], ["plan_handle", "varbinary(64)"], ["database_id", "smallint"],
+      ["blocking_session_id", "smallint"], ["wait_type", "nvarchar(60)"], ["wait_time", "int"],
+      ["last_wait_type", "nvarchar(60)"], ["wait_resource", "nvarchar(256)"], ["cpu_time", "int"],
+      ["total_elapsed_time", "int"], ["reads", "bigint"], ["writes", "bigint"], ["logical_reads", "bigint"],
+      ["granted_query_memory", "int"]]},
+    {"database": "", "schema": "sys", "name": "dm_exec_sessions", "type": "View", "columns": [
+      ["session_id", "smallint"], ["login_time", "datetime"], ["host_name", "nvarchar(128)"],
+      ["program_name", "nvarchar(128)"], ["login_name", "nvarchar(128)"], ["status", "nvarchar(30)"],
+      ["cpu_time", "int"], ["memory_usage", "int"], ["reads", "bigint"], ["writes", "bigint"],
+      ["logical_reads", "bigint"], ["database_id", "smallint"], ["open_transaction_count", "int"]]},
+    {"database": "", "schema": "sys", "name": "dm_os_wait_stats", "type": "View", "columns": [
+      ["wait_type", "nvarchar(60)"], ["waiting_tasks_count", "bigint"], ["wait_time_ms", "bigint"],
+      ["max_wait_time_ms", "bigint"], ["signal_wait_time_ms", "bigint"]]},
+    {"database": "", "schema": "sys", "name": "dm_db_index_usage_stats", "type": "View", "columns": [
+      ["database_id", "smallint"], ["object_id", "int"], ["index_id", "int"], ["user_seeks", "bigint"],
+      ["user_scans", "bigint"], ["user_lookups", "bigint"], ["user_updates", "bigint"],
+      ["last_user_seek", "datetime"], ["last_user_scan", "datetime"], ["last_user_lookup", "datetime"],
+      ["last_user_update", "datetime"]]},
+    {"database": "", "schema": "sys", "name": "dm_db_missing_index_details", "type": "View", "columns": [
+      ["index_handle", "int"], ["database_id", "smallint"], ["object_id", "int"],
+      ["equality_columns", "nvarchar(4000)"], ["inequality_columns", "nvarchar(4000)"],
+      ["included_columns", "nvarchar(4000)"], ["statement", "nvarchar(4000)"]]},
+    {"database": "", "schema": "sys", "name": "dm_db_missing_index_groups", "type": "View", "columns": [
+      ["index_group_handle", "int"], ["index_handle", "int"]]},
+    {"database": "", "schema": "sys", "name": "dm_db_missing_index_group_stats", "type": "View", "columns": [
+      ["group_handle", "int"], ["unique_compiles", "bigint"], ["user_seeks", "bigint"], ["user_scans", "bigint"],
+      ["last_user_seek", "datetime"], ["avg_total_user_cost", "float"], ["avg_user_impact", "float"]]},
+    {"database": "", "schema": "sys", "name": "dm_db_index_physical_stats", "type": "TableFunction", "columns": [
+      ["database_id", "smallint"], ["object_id", "int"], ["index_id", "int"], ["partition_number", "int"],
+      ["index_type_desc", "nvarchar(60)"], ["alloc_unit_type_desc", "nvarchar(60)"], ["index_depth", "tinyint"],
+      ["avg_fragmentation_in_percent", "float"], ["fragment_count", "bigint"], ["page_count", "bigint"]],
+     "parameters": [["@database_id", "smallint"], ["@object_id", "int"], ["@index_id", "int"],
+                    ["@partition_number", "int"], ["@mode", "nvarchar(20)"]]},
+    {"database": "", "schema": "sys", "name": "dm_db_stats_properties", "type": "TableFunction", "columns": [
+      ["object_id", "int"], ["stats_id", "int"], ["last_updated", "datetime2"], ["rows", "bigint"],
+      ["rows_sampled", "bigint"], ["steps", "int"], ["unfiltered_rows", "bigint"], ["modification_counter", "bigint"]],
+     "parameters": [["@object_id", "int"], ["@stats_id", "int"]]},
+    {"database": "", "schema": "sys", "name": "objects", "type": "View", "columns": [
+      ["name", "sysname"], ["object_id", "int"], ["principal_id", "int"], ["schema_id", "int"],
+      ["parent_object_id", "int"], ["type", "char(2)"], ["type_desc", "nvarchar(60)"], ["create_date", "datetime"],
+      ["modify_date", "datetime"], ["is_ms_shipped", "bit"]]},
+    {"database": "", "schema": "sys", "name": "tables", "type": "View", "columns": [
+      ["name", "sysname"], ["object_id", "int"], ["schema_id", "int"], ["type_desc", "nvarchar(60)"],
+      ["create_date", "datetime"], ["modify_date", "datetime"], ["is_ms_shipped", "bit"], ["lob_data_space_id", "int"],
+      ["is_memory_optimized", "bit"], ["temporal_type_desc", "nvarchar(60)"]]},
+    {"database": "", "schema": "sys", "name": "indexes", "type": "View", "columns": [
+      ["object_id", "int"], ["name", "sysname"], ["index_id", "int"], ["type", "tinyint"], ["type_desc", "nvarchar(60)"],
+      ["is_unique", "bit"], ["is_primary_key", "bit"], ["fill_factor", "tinyint"], ["is_disabled", "bit"],
+      ["has_filter", "bit"], ["filter_definition", "nvarchar(max)"]]},
+    {"database": "", "schema": "sys", "name": "columns", "type": "View", "columns": [
+      ["object_id", "int"], ["name", "sysname"], ["column_id", "int"], ["system_type_id", "tinyint"],
+      ["user_type_id", "int"], ["max_length", "smallint"], ["precision", "tinyint"], ["scale", "tinyint"],
+      ["is_nullable", "bit"], ["is_identity", "bit"], ["is_computed", "bit"]]},
+    {"database": "", "schema": "sys", "name": "stats", "type": "View", "columns": [
+      ["object_id", "int"], ["name", "sysname"], ["stats_id", "int"], ["auto_created", "bit"], ["user_created", "bit"],
+      ["no_recompute", "bit"], ["has_filter", "bit"], ["filter_definition", "nvarchar(max)"], ["is_temporary", "bit"],
+      ["is_incremental", "bit"]]},
+    {"database": "", "schema": "sys", "name": "partitions", "type": "View", "columns": [
+      ["partition_id", "bigint"], ["object_id", "int"], ["index_id", "int"], ["partition_number", "int"],
+      ["hobt_id", "bigint"], ["rows", "bigint"], ["data_compression", "tinyint"], ["data_compression_desc", "nvarchar(60)"]]},
+    {"database": "", "schema": "sys", "name": "fn_varbintohexstr", "type": "ScalarFunction",
+     "parameters": [["@pbinin", "varbinary(max)"]]},
+    {"database": "", "schema": "sys", "name": "sp_spaceused", "type": "Procedure",
+     "parameters": [["@objname", "nvarchar(776)", "default"], ["@updateusage", "varchar(5)", "default"],
+                    ["@mode", "varchar(11)", "default"], ["@oneresultset", "bit", "default"],
+                    ["@include_total_xtp_storage", "bit", "default"]]},
+    {"database": "", "schema": "sys", "name": "sp_helpindex", "type": "Procedure",
+     "parameters": [["@objname", "nvarchar(776)"]]},
+    {"database": "", "schema": "sys", "name": "sp_updatestats", "type": "Procedure",
+     "parameters": [["@resample", "char(8)", "default"]]},
+    {"database": "", "schema": "sys", "name": "sp_recompile", "type": "Procedure",
+     "parameters": [["@objname", "nvarchar(776)"]]},
+    {"database": "", "schema": "INFORMATION_SCHEMA", "name": "TABLES", "type": "View", "columns": [
+      ["TABLE_CATALOG", "nvarchar(128)"], ["TABLE_SCHEMA", "nvarchar(128)"], ["TABLE_NAME", "sysname"],
+      ["TABLE_TYPE", "varchar(10)"]]},
+    {"database": "", "schema": "INFORMATION_SCHEMA", "name": "COLUMNS", "type": "View", "columns": [
+      ["TABLE_CATALOG", "nvarchar(128)"], ["TABLE_SCHEMA", "nvarchar(128)"], ["TABLE_NAME", "sysname"],
+      ["COLUMN_NAME", "sysname"], ["ORDINAL_POSITION", "int"], ["COLUMN_DEFAULT", "nvarchar(4000)"],
+      ["IS_NULLABLE", "varchar(3)"], ["DATA_TYPE", "nvarchar(128)"], ["CHARACTER_MAXIMUM_LENGTH", "int"],
+      ["NUMERIC_PRECISION", "tinyint"], ["NUMERIC_SCALE", "int"]]}
+  ],
+  "types": [
+    {"database": "SalesDb", "schema": "dbo", "name": "Phone", "isTableType": false},
+    {"database": "SalesDb", "schema": "dbo", "name": "OrderIdList", "isTableType": true, "columns": [
+      ["OrderID", "int"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "ProductQty", "isTableType": true, "columns": [
+      ["ProductID", "int"], ["Quantity", "int"]]},
+    {"database": "SalesDb", "schema": "sales", "name": "InvoiceNumber", "isTableType": false},
+    {"database": "Warehouse", "schema": "dbo", "name": "BinCode", "isTableType": false},
+    {"database": "Warehouse", "schema": "dbo", "name": "PickList", "isTableType": true, "columns": [
+      ["BinID", "int"], ["PickQty", "int"]]},
+    {"database": "", "schema": "sys", "name": "sysname", "isTableType": false}
   ]
 }

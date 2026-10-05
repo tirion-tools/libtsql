@@ -1,10 +1,12 @@
-// tsql::editor::Classify: token classes for colouring. Every token gets its lexer class; identifiers
-// the version's parser takes as keywords (actions or predicates that check their text), as built-in
-// data type names or, followed by '(', as built-in function names are classed as such.
+// Token classes for colouring (tsql::editor::Classify, Document::Classify). Every token gets its
+// lexer class; identifiers the version's parser takes as keywords (actions or predicates that check
+// their text), as built-in data type names or, followed by '(', as built-in function names are
+// classed as such.
 #include <algorithm>
 
+#include "Buffer.h"
 #include "Builtins.h"
-#include "Grammar.h"
+#include "Editor.h"
 #include "Names.h"
 #include "tsql/ast/generated/token_types.hpp"
 #include "tsql/editor.hpp"
@@ -82,13 +84,23 @@ private:
 
 }  // namespace
 
-std::vector<ColouredSpan> Classify(std::string_view sql, SqlVersion version) {
-    const Grammar& g = GrammarFor(version);
+namespace detail {
+
+std::vector<ColouredSpan> ClassifyRange(Buffer& buffer, size_t start, size_t end) {
+    const Grammar& g = buffer.grammar();
+    const std::string& sql = buffer.Text();
     std::vector<ColouredSpan> spans;
-    if (sql.empty()) return spans;
-    const ParsedTokens parsed = g.ParseAll(sql);
+    end = std::min(end, sql.size());
+    if (start >= end) return spans;
+    const std::vector<LexToken>& toks = buffer.Tokens();
+    // tokens [first, last) overlap the range (ends and starts are increasing)
+    const size_t first = static_cast<size_t>(
+        std::upper_bound(toks.begin(), toks.end(), start, [](size_t s, const LexToken& t) { return s < t.end; }) -
+        toks.begin());
+    const size_t last = std::max(first, buffer.TokenAt(end));
+    buffer.EnsureParsed(first, last);
+    const std::vector<TokenRole>& roles = buffer.Roles();
     const IdentifierClassifier identifiers(g);
-    const auto& toks = parsed.tokens;
 
     auto nextVisible = [&](size_t i) -> uint32_t {
         for (size_t k = i + 1; k < toks.size(); ++k)
@@ -96,29 +108,41 @@ std::vector<ColouredSpan> Classify(std::string_view sql, SqlVersion version) {
         return 0;
     };
     uint32_t prevVisible = 0;
-    size_t pos = 0;
-    spans.reserve(toks.size() + 1);
-    for (size_t i = 0; i < toks.size(); ++i) {
+    for (size_t k = first; k-- > 0;)
+        if (!IsHiddenType(toks[k].type)) {
+            prevVisible = toks[k].type;
+            break;
+        }
+    auto add = [&](size_t s, size_t length, TokenClass cls) {
+        if (s < end && s + length > start) spans.push_back({s, length, cls});
+    };
+    size_t pos = first > 0 ? toks[first - 1].end : 0;
+    spans.reserve(last - first + 2);
+    for (size_t i = first; i < last; ++i) {
         const LexToken& t = toks[i];
         if (t.end <= pos) continue;
-        if (t.start > pos) spans.push_back({pos, t.start - pos, TokenClass::Error});
-        const size_t start = std::max<size_t>(t.start, pos);
+        if (t.start > pos) add(pos, t.start - pos, TokenClass::Error);
+        const size_t s = std::max<size_t>(t.start, pos);
         TokenClass cls = LexerClass(t.type);
         if (cls == TokenClass::Identifier || cls == TokenClass::Keyword) {
-            const std::string upper = Upper(sql.substr(t.start, t.end - t.start));
+            const std::string upper = Upper(std::string_view(sql).substr(t.start, t.end - t.start));
             const Builtin* b = FindBuiltin(upper);
             if (b != nullptr && b->kind != Builtin::Kind::GlobalVariable && prevVisible != Ty(T::Dot) &&
                 nextVisible(i) == Ty(T::LeftParenthesis))
                 cls = TokenClass::BuiltinFunction;
             else if (t.type == Ty(T::Identifier))
-                cls = identifiers.Classify(parsed.roles[i], t.type, upper);
+                cls = identifiers.Classify(roles[i], t.type, upper);
         }
-        spans.push_back({start, t.end - start, cls});
+        add(s, t.end - s, cls);
         pos = t.end;
         if (!IsHiddenType(t.type)) prevVisible = t.type;
     }
-    if (pos < sql.size()) spans.push_back({pos, sql.size() - pos, TokenClass::Error});
+    // bytes no token covers up to the next token (or the end)
+    const size_t next = last < toks.size() ? std::max<size_t>(toks[last].start, pos) : sql.size();
+    if (pos < next) add(pos, next - pos, TokenClass::Error);
     return spans;
 }
+
+}  // namespace detail
 
 }  // namespace tsql::editor

@@ -161,3 +161,4 @@ target_link_libraries(tsql_dump PRIVATE tsql_parser)
 
 add_executable(tsql_bench ${PROJECT_SOURCE_DIR}/pilot/bench.cpp)
 target_link_libraries(tsql_bench PRIVATE tsql_parser)
+target_include_directories(tsql_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

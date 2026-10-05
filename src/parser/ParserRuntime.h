@@ -52,6 +52,24 @@ protected:
                    antlr4::ParserRuleContext* outerContext) override;
     /// Alternative number of the exit branch of a (...)* or (...)+ loop decision, or INVALID.
     static size_t LoopExitAlternative(const antlr4::atn::DecisionState* d);
+    /// SLL prediction without collected predicates: the same closure as ANTLR's (the same
+    /// configurations and closureBusy checks in the same order) without a configuration object per
+    /// step, and a configuration that falls off a rule replays that rule's recorded follow walk.
+    void closureCheckingStopState(const Ref<antlr4::atn::ATNConfig>& config, antlr4::atn::ATNConfigSet* configs,
+                                  antlr4::atn::ATNConfig::Set& closureBusy, bool collectPredicates, bool fullCtx,
+                                  int depth, bool treatEofAsEpsilon) override;
+
+private:
+    struct SecondTokens;
+    struct FallOff;
+    /// The tokens that can follow alternative `alt`'s first token in decision `dfa`, from its SLL
+    /// start configurations; computed once per (decision, alternative).
+    const SecondTokens& SecondTokensFor(const antlr4::dfa::DFA& dfa, const antlr4::atn::ATNConfigSet& start, size_t alt);
+    /// The walk of a configuration that falls off rule stop state `stop`; recorded once per ATN.
+    const FallOff& FallOffFor(antlr4::atn::ATNState* stop, bool treatEofAsEpsilon);
+    /// Takes `fallOff`'s steps for `config` (at its stop state) as ANTLR's closure_ would.
+    void Replay(const Ref<antlr4::atn::ATNConfig>& config, antlr4::atn::ATNConfigSet* configs,
+                antlr4::atn::ATNConfig::Set& closureBusy, bool treatEofAsEpsilon, const FallOff& fallOff);
 };
 
 }  // namespace tsql::parser

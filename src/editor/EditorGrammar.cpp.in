@@ -11,8 +11,8 @@ namespace {
 
 const Grammar& EditorGrammar@G@() {
     static const GrammarImpl<parser::@G@Lexer, parser::@G@Parser> grammar(
-        SqlVersion::@V@, @FLAG@, kKeywordStates, sizeof(kKeywordStates) / sizeof(kKeywordStates[0]), kPredicates,
-        sizeof(kPredicates) / sizeof(kPredicates[0]));
+        SqlVersion::@V@, @FLAG@, kKeywordStates, sizeof(kKeywordStates) / sizeof(kKeywordStates[0]), kKeywordGuards,
+        kPredicates, sizeof(kPredicates) / sizeof(kPredicates[0]));
     return grammar;
 }
 

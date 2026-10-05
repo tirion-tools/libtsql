@@ -24,32 +24,38 @@ bool OneOf(uint32_t type, std::initializer_list<T> types) {
 // ============================================================================================ tokens
 
 ScriptTokens::ScriptTokens(std::string_view sql, const std::vector<LexToken>& all) : sql_(sql) {
-    toks_.reserve(all.size());
+    own_.reserve(all.size());
     for (const LexToken& t : all)
-        if (!IsHiddenType(t.type)) toks_.push_back(t);
+        if (!IsHiddenType(t.type)) own_.push_back(t);
+    toks_ = own_.data();
+    n_ = own_.size();
 }
 
 std::string_view ScriptTokens::Text(size_t i) const {
-    if (i >= toks_.size()) return {};
+    if (i >= n_) return {};
     return sql_.substr(toks_[i].start, toks_[i].end - toks_[i].start);
 }
 
-bool ScriptTokens::Is(size_t i, std::string_view upper) const { return i < toks_.size() && EqualsI(Text(i), upper); }
+bool ScriptTokens::Is(size_t i, std::string_view upper) const { return i < n_ && EqualsI(Text(i), upper); }
 
-bool ScriptTokens::IsName(size_t i) const {
-    return i < toks_.size() && OneOf(toks_[i].type, {T::Identifier, T::QuotedIdentifier});
-}
+bool ScriptTokens::IsName(size_t i) const { return i < n_ && OneOf(toks_[i].type, {T::Identifier, T::QuotedIdentifier}); }
 
 std::string ScriptTokens::Name(size_t i) const { return Unquote(Text(i)); }
 
 size_t ScriptTokens::IndexAt(size_t offset) const {
-    return static_cast<size_t>(std::lower_bound(toks_.begin(), toks_.end(), offset,
-                                                [](const LexToken& t, size_t o) { return t.start < o; }) -
-                               toks_.begin());
+    return static_cast<size_t>(
+        std::lower_bound(toks_, toks_ + n_, offset, [](const LexToken& t, size_t o) { return t.start < o; }) - toks_);
+}
+
+bool ScriptTokens::LineStart(size_t i) const {
+    if (i >= n_) return false;
+    if (i == 0) return true;
+    const size_t from = std::min<size_t>(toks_[i - 1].end, toks_[i].start);
+    return sql_.substr(from, toks_[i].start - from).find('\n') != std::string_view::npos;
 }
 
 size_t ScriptTokens::BatchStart(size_t i) const {
-    for (size_t k = std::min(i, toks_.size()); k > 0; --k)
+    for (size_t k = std::min(i, n_); k > 0; --k)
         if (toks_[k - 1].type == Ty(T::Go)) return k;
     return 0;
 }
@@ -87,16 +93,19 @@ public:
                     head_ = i;
                     main_ = 0;
                     insertSource_ = false;
+                    principals_ = false;
                     caseDepth = 0;
                 }
                 if (main_ == 0 && OneOf(type, {T::Select, T::Insert, T::Update, T::Delete, T::Merge})) main_ = type;
                 else if (main_ == Ty(T::Insert) && OneOf(type, {T::Select, T::Values, T::Exec, T::Execute}))
                     insertSource_ = true;
+                if (OneOf(type, {T::To, T::From}) && OneOf(t_.Type(head_), {T::Grant, T::Deny, T::Revoke})) principals_ = true;
             }
             if (type == Ty(T::Case)) ++caseDepth;
             else if (closesCase) --caseDepth;
-            if (type == Ty(T::LeftParenthesis)) ++depth;
-            else if (type == Ty(T::RightParenthesis) && depth > 0) --depth;
+            // ( ) and the { } of ODBC escapes ({fn ...}, {d '...'})
+            if (type == Ty(T::LeftParenthesis) || type == Ty(T::LeftCurly)) ++depth;
+            else if ((type == Ty(T::RightParenthesis) || type == Ty(T::RightCurly)) && depth > 0) --depth;
         }
     }
 
@@ -106,59 +115,136 @@ private:
         const uint32_t prev = i > 0 ? t_.Type(i - 1) : 0;
         const uint32_t head = t_.Type(head_);
         const bool afterCteList = prev == Ty(T::RightParenthesis) && head == Ty(T::With) && main_ == 0;
+        // GRANT, DENY, REVOKE: permissions (SELECT, ALTER, CREATE ..., EXECUTE) and securables up to TO / FROM
+        if (OneOf(head, {T::Grant, T::Deny, T::Revoke}) && !principals_) return false;
         switch (static_cast<T>(type)) {
             case T::Declare: case T::Print: case T::While: case T::Truncate: case T::Return: case T::Dbcc:
             case T::Checkpoint: case T::Raiserror: case T::WaitFor: case T::Close: case T::Open: case T::Deallocate:
-            case T::GoTo: case T::Commit: case T::Rollback: case T::Save: case T::Kill: case T::Backup: case T::Restore:
-            case T::Break: case T::Continue: case T::Begin: case T::End: case T::Fetch:
+            case T::GoTo: case T::Commit: case T::Save: case T::Kill: case T::Backup: case T::Restore:
+            case T::Break: case T::Continue: case T::Begin:
+            case T::UpdateText: case T::WriteText: case T::ReadText: case T::Label:
+            case T::Shutdown: case T::SetUser:
                 return true;
+            case T::Reconfigure:
+                return !t_.Is(i - 1, "GOVERNOR");   // ALTER RESOURCE GOVERNOR RECONFIGURE
+            case T::LeftParenthesis: {
+                // a parenthesized query after the closing parenthesis of one: (select ...) (((select ...)))
+                size_t k = i;
+                while (t_.Type(k) == Ty(T::LeftParenthesis)) ++k;
+                if (t_.Type(k) != Ty(T::Select) || prev != Ty(T::RightParenthesis)) return false;
+                if (main_ == Ty(T::Insert) && !insertSource_) return false;   // INSERT t (c1) (SELECT ...)
+                return !afterCteList;
+            }
+            case T::Revert:
+                return !t_.Is(i - 1, "NO");   // EXECUTE AS ... WITH NO REVERT
+            case T::End:
+                // GENERATED ALWAYS AS ROW END (a column of a system-versioned table)
+                return !(t_.Is(i - 3, "ALWAYS") && t_.Type(i - 2) == Ty(T::As));
+            case T::Rollback:
+                return prev != Ty(T::With);   // ALTER DATABASE ... WITH ROLLBACK IMMEDIATE
+            case T::Fetch:
+                // ORDER BY ... [OFFSET n ROWS] FETCH { NEXT | FIRST } n ROWS ONLY / FETCH APPROXIMATE
+                if (t_.Is(i + 1, "APPROX") || t_.Is(i + 1, "APPROXIMATE")) return false;
+                return !((t_.Is(i + 1, "NEXT") || t_.Is(i + 1, "FIRST")) && t_.Type(i + 2) != Ty(T::From));
+            case T::Bulk:
+                return t_.Type(i + 1) == Ty(T::Insert);
+            case T::Add:   // ADD [COUNTER] SIGNATURE
+                return t_.Is(i + 1, "SIGNATURE") || (t_.Is(i + 1, "COUNTER") && t_.Is(i + 2, "SIGNATURE"));
             case T::Grant: case T::Deny: case T::Revoke:
                 return prev != Ty(T::With);
             case T::Create:
                 return true;
             case T::Alter: case T::Drop:
-                return head != Ty(T::Alter) || prev == Ty(T::Semicolon);
+                // CREATE OR ALTER; lists of clauses (ALTER SECURITY POLICY p DROP ..., ALTER ...)
+                if (prev == Ty(T::Or) || prev == Ty(T::Comma)) return false;
+                // in an ALTER statement they are mostly clauses (ALTER COLUMN, DROP CONSTRAINT, ...): a
+                // new statement after a ';', or at the start of a line unless a clause's word follows
+                if (head != Ty(T::Alter) || prev == Ty(T::Semicolon)) return true;
+                return t_.LineStart(i) && !AlterClause(i, i + 1);
             case T::Use:
                 return prev != Ty(T::LeftParenthesis) && prev != Ty(T::Comma);
             case T::If:
                 if (t_.Type(i + 1) == Ty(T::Exists) &&
                     (OneOf(prev, {T::Table, T::View, T::Index, T::Procedure, T::Proc, T::Function, T::Trigger, T::Schema,
-                                  T::Database, T::Statistics, T::User, T::Default, T::Rule}) ||
+                                  T::Database, T::Statistics, T::User, T::Default, T::Rule, T::Constraint, T::Column}) ||
                      prev == Ty(T::Identifier)))
                     return false;
                 return true;
             case T::Select:
                 if (OneOf(prev, {T::Union, T::All, T::Except, T::Intersect, T::LeftParenthesis, T::As, T::Grant, T::Deny,
-                                 T::Revoke, T::Comma}))
+                                 T::Revoke, T::Comma}) ||
+                    t_.Is(i - 1, "OFFSETS"))   // SET OFFSETS SELECT, FROM, ... ON
                     return false;
                 if (main_ == Ty(T::Insert) && !insertSource_) return false;
                 return !afterCteList;
             case T::Insert: case T::Update: case T::Delete: case T::Merge:
                 if (OneOf(prev, {T::Then, T::For, T::Comma, T::LeftParenthesis, T::On, T::Of, T::Grant, T::Deny, T::Revoke,
-                                 T::As}))
+                                 T::As, T::Bulk}))
                     return false;
-                if (t_.Is(i - 1, "AFTER") || t_.Is(i - 1, "OF")) return false;
+                if (t_.Is(i - 1, "AFTER") || t_.Is(i - 1, "BEFORE") || t_.Is(i - 1, "OF") || t_.Is(i - 1, "START"))
+                    return false;   // trigger events, security policy predicates, START UPDATE POPULATION
+                if (type == Ty(T::Update) && t_.Type(i + 1) == Ty(T::LeftParenthesis)) return false;   // IF UPDATE(c)
+                if (type == Ty(T::Merge) && (t_.Is(i + 1, "RANGE") || t_.Type(i + 1) == Ty(T::Join) ||
+                                             (head == Ty(T::Alter) && prev == Ty(T::RightParenthesis))))
+                    return false;   // ALTER PARTITION FUNCTION f() MERGE RANGE, MERGE JOIN
                 return !afterCteList;
             case T::Set:
-                if (prev == Ty(T::Update)) return false;
+                if (prev == Ty(T::Update) || t_.Type(i + 1) == Ty(T::LeftParenthesis)) return false;
                 return !OneOf(head, {T::Update, T::Alter, T::Merge}) && main_ != Ty(T::Update) && main_ != Ty(T::Merge);
             case T::Exec: case T::Execute:
                 if (main_ == Ty(T::Insert) && !insertSource_) return false;
                 return !OneOf(prev, {T::LeftParenthesis, T::With, T::Comma});
             case T::With: {
-                if (t_.Is(i + 1, "XMLNAMESPACES")) return true;
-                return t_.IsName(i + 1) && OneOf(t_.Type(i + 2), {T::As, T::LeftParenthesis}) &&
-                       prev != Ty(T::RightParenthesis);
+                if (t_.Is(i + 1, "XMLNAMESPACES"))   // not a clause of CREATE / ALTER ... XML INDEX
+                    return !(OneOf(head, {T::Create, T::Alter}) &&
+                             (t_.Type(head_ + 1) == Ty(T::Index) || t_.Is(head_ + 1, "XML") || t_.Is(head_ + 2, "XML") ||
+                              t_.Is(head_ + 3, "XML")));
+                // WITH name AS ( or WITH name (columns) AS (: not WITH SCHEMABINDING AS, WITH option(...)
+                if (!t_.IsName(i + 1) || prev == Ty(T::RightParenthesis)) return false;
+                size_t k = i + 2;
+                if (t_.Type(k) == Ty(T::LeftParenthesis)) {
+                    for (size_t d = 0; k < t_.size(); ++k) {
+                        if (t_.Type(k) == Ty(T::LeftParenthesis)) ++d;
+                        else if (t_.Type(k) == Ty(T::RightParenthesis) && --d == 0) break;
+                    }
+                    ++k;
+                }
+                return t_.Type(k) == Ty(T::As) && t_.Type(k + 1) == Ty(T::LeftParenthesis);
             }
+            case T::Identifier:
+                // statements whose first word is not a keyword token
+                if (t_.Is(i, "COPY")) return t_.Type(i + 1) == Ty(T::Into);
+                if (t_.Is(i, "SEND")) return t_.Type(i + 1) == Ty(T::On);
+                if (t_.Is(i, "GET")) return t_.Is(i + 1, "CONVERSATION");
+                if (t_.Is(i, "RECEIVE"))
+                    return OneOf(t_.Type(i + 1), {T::Star, T::Top, T::Variable});
+                if (t_.Is(i, "THROW"))
+                    return i + 1 >= t_.size() || t_.LineStart(i + 1) ||
+                           OneOf(t_.Type(i + 1), {T::Integer, T::Variable, T::Semicolon, T::End});
+                return false;
             default:
                 return false;
         }
+    }
+
+    /// Whether the words after the ALTER or DROP at `at` continue an ALTER statement (ALTER COLUMN,
+    /// DROP CONSTRAINT, DROP PERIOD FOR SYSTEM_TIME, DROP MEMBER, DROP FILE, ...).
+    bool AlterClause(size_t at, size_t i) const {
+        if (OneOf(t_.Type(i), {T::LeftParenthesis, T::AsciiStringLiteral, T::UnicodeStringLiteral, T::Integer})) return true;
+        for (const char* w : {"COLUMN", "REPLICA", "LISTENER", "FILTER", "BLOCK"})
+            if (t_.Is(i, w)) return true;
+        if (t_.Type(at) == Ty(T::Alter)) return false;
+        for (const char* w : {"CONSTRAINT", "PERIOD", "MEMBER", "FILE", "FILEGROUP", "EVENT", "TARGET", "VALUE", "CREDENTIAL",
+                              "CONTRACT", "SIGNATURE", "COUNTER", "ROUTE", "PREDICATE", "SPECIFICATION"})
+            if (t_.Is(i, w)) return true;
+        return false;
     }
 
     const ScriptTokens& t_;
     size_t head_ = 0;
     uint32_t main_ = 0;
     bool insertSource_ = false;
+    bool principals_ = false;   // GRANT / DENY / REVOKE: TO or FROM seen
 };
 
 /// The first statement boundary after token `from` (a ';', GO, or the start of the next statement),
@@ -191,8 +277,8 @@ size_t StatementEnd(const ScriptTokens& t, size_t start, size_t from) {
 
 }  // namespace
 
-size_t StatementStartFromTokens(const ScriptTokens& tokens, size_t at) {
-    const size_t batch = tokens.BatchStart(at);
+size_t StatementStartFromTokens(const ScriptTokens& tokens, size_t at, size_t from) {
+    const size_t batch = from == SIZE_MAX ? tokens.BatchStart(at) : from;
     size_t last = batch;
     StatementScanner(tokens).Run(batch, tokens.size(), [&](size_t i) {
         if (i > at) return false;
@@ -669,6 +755,10 @@ struct ScopeAnalyzer::Impl {
                 spec.fromEnd = on == SIZE_MAX ? e : on;
                 ReadSources(spec.fromStart, spec.fromEnd, d, spec.sources);
             }
+        } else if (head == Ty(T::Alter) && t.Type(j) == Ty(T::Table)) {
+            // ALTER TABLE t ...: its columns (PERIOD FOR SYSTEM_TIME (start, end), ...)
+            spec.kind = Spec::Kind::IndexTarget;
+            ReadTarget(j + 1, spec.target);
         } else if (head == Ty(T::Create) || head == Ty(T::Update) || head == Ty(T::Alter)) {
             // CREATE [UNIQUE] [CLUSTERED|NONCLUSTERED] [COLUMNSTORE] INDEX x ON t, CREATE STATISTICS s ON t,
             // UPDATE STATISTICS t, ALTER INDEX x ON t
@@ -721,21 +811,40 @@ struct ScopeAnalyzer::Impl {
         return out;
     }
 
-    const CatalogObject* FindObject(const std::vector<std::string>& partsIn) const {
-        std::vector<std::string> parts = partsIn;
-        if (parts.size() > 3) parts.erase(parts.begin(), parts.end() - 3);
-        std::string db = currentDb, name = parts.empty() ? std::string() : parts.back();
+    /// Schemas the name `parts` is looked up in: its own, else the default schema and dbo (and sys
+    /// for `systemNames`).
+    std::vector<std::string> SearchSchemas(const std::vector<std::string>& parts, bool systemNames) const {
         std::vector<std::string> schemas;
         if (parts.size() >= 2 && !parts[parts.size() - 2].empty()) {
             schemas.push_back(parts[parts.size() - 2]);
-        } else {
-            schemas.push_back(catalog.defaultSchema);
-            if (!EqualsI(catalog.defaultSchema, "dbo")) schemas.push_back("dbo");
+            return schemas;
         }
-        if (parts.size() == 3 && !parts[0].empty()) db = parts[0];
-        for (const std::string& schema : schemas)
-            for (const CatalogObject& o : catalog.objects)
-                if (EqualsI(o.name, name) && EqualsI(o.schema, schema) && EqualsI(o.database, db)) return &o;
+        schemas.push_back(catalog.defaultSchema);
+        if (!EqualsI(catalog.defaultSchema, "dbo")) schemas.push_back("dbo");
+        if (systemNames) schemas.push_back("sys");
+        return schemas;
+    }
+
+    std::string DatabaseOf(const std::vector<std::string>& parts) const {
+        return parts.size() >= 3 && !parts[parts.size() - 3].empty() ? parts[parts.size() - 3] : currentDb;
+    }
+
+    const CatalogObject* FindObject(const std::vector<std::string>& partsIn) const {
+        if (partsIn.empty() || partsIn.size() > 4) return nullptr;
+        if (partsIn.size() == 4 && !partsIn[0].empty()) return nullptr;   // a linked server
+        const std::string& name = partsIn.back();
+        const bool systemProcedure = StartsWithI(name, "sp_") || StartsWithI(name, "xp_");
+        const std::string db = DatabaseOf(partsIn);
+        for (const std::string& schema : SearchSchemas(partsIn, systemProcedure))
+            if (const CatalogObject* o = FindCatalogObject(catalog, db, schema, name)) return o;
+        return nullptr;
+    }
+
+    const CatalogType* FindType(const std::vector<std::string>& parts) const {
+        if (parts.empty() || parts.size() > 3) return nullptr;
+        const std::string db = DatabaseOf(parts);
+        for (const std::string& schema : SearchSchemas(parts, true))
+            if (const CatalogType* ty = FindCatalogType(catalog, db, schema, parts.back())) return ty;
         return nullptr;
     }
 
@@ -784,6 +893,10 @@ struct ScopeAnalyzer::Impl {
                 return true;
             }
         const CatalogObject* o = FindObject(parts);
+        if (o != nullptr && o->type == CatalogObject::Type::Synonym) {
+            o = SynonymTarget(catalog, *o);
+            if (o == nullptr) return true;   // a synonym of an object the catalog does not have
+        }
         if (o == nullptr) return false;
         out.kind = KindOf(o->type);
         for (const CatalogColumn& c : o->columns) out.columns.push_back({c.name, c.type});
@@ -920,12 +1033,20 @@ std::vector<VariableInfo> ScopeAnalyzer::Impl::Variables() const {
         }
         return s;
     };
-    auto add = [&](size_t at, bool isTable, std::string type) {
+    auto add = [&](size_t at, bool isTable, std::string type, const CatalogType* tableType = nullptr) {
         if (at >= caret) return;
         const std::string name(t.Text(at));
         for (const VariableInfo& v : out)
             if (EqualsI(v.name, name)) return;
-        out.push_back({name, std::move(type), isTable});
+        out.push_back({name, std::move(type), isTable, tableType});
+    };
+    // a variable or parameter of the type written in [a, e): a table variable when it names a
+    // user-defined table type
+    auto addTyped = [&](size_t at, size_t a, size_t e) {
+        std::vector<std::string> parts;
+        const CatalogType* ty = ReadNameAny(t, a, parts) == e ? FindType(parts) : nullptr;
+        if (ty != nullptr && ty->isTableType) add(at, true, typeText(a, e), ty);
+        else add(at, false, typeText(a, e));
     };
     // end of a declaration's type or initializer: ',' or ')' at its depth, '=' (type only), a ';'
     // or a token that starts a statement
@@ -959,7 +1080,7 @@ std::vector<VariableInfo> ScopeAnalyzer::Impl::Variables() const {
                     j = MatchParen(t, j + 1, t.size()) + 1;
                 } else {
                     const size_t e = skipTo(j, true);
-                    add(v, false, typeText(j, e));
+                    addTyped(v, j, e);
                     j = e;
                     if (t.Type(j) == Ty(T::EqualsSign)) j = skipTo(j + 1, false);
                 }
@@ -989,7 +1110,7 @@ std::vector<VariableInfo> ScopeAnalyzer::Impl::Variables() const {
                         size_t k = j + 1;
                         if (t.Type(k) == Ty(T::As)) ++k;
                         const size_t e = SkipParam(t, k);
-                        add(j, false, typeText(k, e));
+                        addTyped(j, k, e);
                     }
                 }
             }
@@ -1003,6 +1124,11 @@ std::vector<VariableInfo> ScopeAnalyzer::Impl::Variables() const {
 
 std::vector<ColumnInfo> ScopeAnalyzer::Impl::TableVariableColumns(const std::string& name) const {
     std::vector<ColumnInfo> out;
+    for (const VariableInfo& v : Variables())
+        if (v.tableType != nullptr && EqualsI(v.name, name)) {
+            for (const CatalogColumn& c : v.tableType->columns) out.push_back({c.name, c.type});
+            return out;
+        }
     const size_t batch = t.BatchStart(caret);
     for (size_t i = batch; i + 2 < caret && i + 2 < t.size(); ++i) {
         if (t.Type(i) != Ty(T::Variable) || !EqualsI(t.Text(i), name)) continue;
@@ -1059,6 +1185,64 @@ std::vector<TempTableInfo> ScopeAnalyzer::Impl::TempTables() const {
         }
     }
     return out;
+}
+
+// ========================================================================================== catalog
+
+bool InDatabase(std::string_view objectDb, std::string_view db) { return objectDb.empty() || EqualsI(objectDb, db); }
+
+const CatalogObject* FindCatalogObject(const Catalog& catalog, std::string_view db, std::string_view schema,
+                                       std::string_view name) {
+    const CatalogObject* system = nullptr;
+    for (const CatalogObject& o : catalog.objects) {
+        if (!EqualsI(o.name, name) || !EqualsI(o.schema, schema)) continue;
+        if (EqualsI(o.database, db)) return &o;
+        if (o.database.empty() && system == nullptr) system = &o;
+    }
+    return system;
+}
+
+const CatalogType* FindCatalogType(const Catalog& catalog, std::string_view db, std::string_view schema,
+                                   std::string_view name) {
+    const CatalogType* system = nullptr;
+    for (const CatalogType& ty : catalog.types) {
+        if (!EqualsI(ty.name, name) || !EqualsI(ty.schema, schema)) continue;
+        if (EqualsI(ty.database, db)) return &ty;
+        if (ty.database.empty() && system == nullptr) system = &ty;
+    }
+    return system;
+}
+
+std::vector<std::string> SplitMultiPartName(std::string_view name) {
+    std::vector<std::string> parts(1);
+    for (size_t i = 0; i < name.size(); ++i) {
+        const char c = name[i];
+        if (c == '.') {
+            parts.emplace_back();
+        } else if ((c == '[' || c == '"') && parts.back().empty()) {
+            const char close = c == '[' ? ']' : '"';
+            for (++i; i < name.size(); ++i) {
+                if (name[i] == close) {
+                    if (i + 1 < name.size() && name[i + 1] == close) ++i;   // ]] or "" inside the name
+                    else break;
+                }
+                parts.back() += name[i];
+            }
+        } else if (c != ' ') {
+            parts.back() += c;
+        }
+    }
+    return parts;
+}
+
+const CatalogObject* SynonymTarget(const Catalog& catalog, const CatalogObject& synonym) {
+    const std::vector<std::string> parts = SplitMultiPartName(synonym.target);
+    if (parts.size() > 3 || parts.back().empty()) return nullptr;   // a linked server's object
+    const std::string& db = parts.size() == 3 && !parts[0].empty() ? parts[0] : synonym.database;
+    const std::string& schema = parts.size() >= 2 && !parts[parts.size() - 2].empty() ? parts[parts.size() - 2]
+                                                                                      : catalog.defaultSchema;
+    const CatalogObject* o = FindCatalogObject(catalog, db, schema, parts.back());
+    return o != nullptr && o->type != CatalogObject::Type::Synonym ? o : nullptr;
 }
 
 // ============================================================================================= API
@@ -1125,5 +1309,7 @@ bool ScopeAnalyzer::ResolveObject(const std::vector<std::string>& parts, SourceI
 const CatalogObject* ScopeAnalyzer::FindObject(const std::vector<std::string>& parts) const {
     return impl_->FindObject(parts);
 }
+
+const CatalogType* ScopeAnalyzer::FindType(const std::vector<std::string>& parts) const { return impl_->FindType(parts); }
 
 }  // namespace tsql::editor::detail

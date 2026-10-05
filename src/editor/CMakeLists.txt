@@ -47,9 +47,11 @@ add_dependencies(tsql_editor_generate tsql_parser_generate)
 add_library(tsql_editor STATIC
     ${editor_grammar_sources}
     ${editor_meta_files}
+    Buffer.cpp
     Builtins.cpp
     Classify.cpp
     Complete.cpp
+    Document.cpp
     Grammar.cpp
     Names.cpp
     Scope.cpp

@@ -1,13 +1,17 @@
 // Unit tests for the internals of the editor support (src/editor): name quoting, UTF-8 offsets,
-// built-in tables, predicate evaluation, statement segmentation, scope analysis, the parser capture
-// and the ATN walk. The contract tests are in tests/editor.
+// built-in tables, predicate evaluation, statement segmentation, scope analysis, the parser capture,
+// the ATN walk, incremental lexing and parsing (a Document after edits equals the free functions on
+// its text), and Warm running concurrently with Documents. The contract tests are in tests/editor.
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <set>
 #include <string>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
+#include "Buffer.h"
 #include "Builtins.h"
 #include "Grammar.h"
 #include "Names.h"
@@ -162,6 +166,12 @@ void TestStatements() {
     CHECK_EQ(StatementAt("BEGIN TRY SELECT b FROM t END TRY", "b FROM"), std::string("SELECT"));
     CHECK_EQ(StatementAt("SELECT 1\nGO\nSELECT b FROM t", "b FROM"), std::string("SELECT"));
     CHECK_EQ(StatementAt("GRANT SELECT, INSERT ON t TO u", "u"), std::string("GRANT"));
+    // a parenthesized query after one; not a function argument or an INSERT's source
+    CHECK_EQ(StatementAt("SELECT a FROM t WHERE (a = 1)\n(((SELECT b FROM u)))", "b FROM"), std::string("("));
+    CHECK_EQ(StatementAt("SELECT f((SELECT 1)), b FROM t", "b FROM"), std::string("SELECT"));
+    CHECK_EQ(StatementAt("INSERT INTO t (a) (SELECT b FROM u)", "b FROM"), std::string("INSERT"));
+    CHECK_EQ(StatementAt("ALTER RESOURCE GOVERNOR RECONFIGURE", "RECONFIGURE"), std::string("ALTER"));
+    CHECK_EQ(StatementAt("ALTER RESOURCE GOVERNOR DISABLE\nRECONFIGURE", "RECONFIGURE"), std::string("RECONFIGURE"));
 }
 
 void TestScope() {
@@ -181,7 +191,7 @@ void TestScope() {
     tsql::editor::Catalog catalog;
     catalog.currentDatabase = "SalesDb";
     catalog.objects.push_back({"Warehouse", "dbo", "Orders", tsql::editor::CatalogObject::Type::Table,
-                               {{"OrderID", "int"}, {"TotalDue", "money"}}});
+                               {{"OrderID", "int"}, {"TotalDue", "money"}}, {}, {}});
     const ScopeAnalyzer scope(t, catalog, t.IndexAt(caret), SIZE_MAX);
     CHECK_EQ(scope.CurrentDatabase(), std::string("Warehouse"));
 
@@ -242,8 +252,15 @@ void TestScopeQueries() {
     CHECK(sourcesAt("v.k") == (std::set<std::string>{"v", "x", "y", "z", "q"}));
 }
 
+/// The parse of `text` from its start to its end (the caret).
+CaretParse Prefix(const std::string& text) {
+    Buffer b(G());
+    b.SetText(text);
+    return G().ParseToCaret(b.View(), ResumePoint{}, b.Tokens().size())->result;
+}
+
 void TestCapture() {
-    const CaretParse ps = G().ParseToCaret("SELECT FROM WHERE;\nSELECT * FROM t WITH (");
+    const CaretParse ps = Prefix("SELECT FROM WHERE;\nSELECT * FROM t WITH (");
     CHECK(ps.capture.captured);
     CHECK(!ps.capture.errorInStatement);   // the error was in the previous statement
     CHECK(ps.syntaxErrors);
@@ -262,14 +279,263 @@ void TestCapture() {
     CHECK(words.count("NOLOCK") == 1);
     CHECK(words.count("RECOMPILE") == 0);
 
-    const CaretParse broken = G().ParseToCaret("SELECT a FROM t WHERE = = AND ");
+    const CaretParse broken = Prefix("SELECT a FROM t WHERE = = AND ");
     CHECK(broken.capture.captured);
     CHECK(broken.capture.errorInStatement);
     CHECK_EQ(broken.capture.statementIndex, size_t(0));
 
-    const CaretParse empty = G().ParseToCaret("");
+    const CaretParse empty = Prefix("");
     CHECK(empty.capture.captured);
     CHECK(!empty.syntaxErrors);
+
+    // the parser stands inside identifier, called from tablePeriodDefinition with a Match(SYSTEM_TIME)
+    // check: the walk starts past that call and must still apply the check
+    const CaretParse period = Prefix("ALTER TABLE t ADD PERIOD FOR ");
+    CHECK(period.capture.captured);
+    CHECK(period.capture.pendingCall >= 0);
+    WalkInput pin;
+    pin.tokens = &period.tokens;
+    pin.upper = &period.upper;
+    pin.startState = period.capture.state;
+    pin.startIndex = period.capture.index;
+    pin.outerFollow = period.capture.follow;
+    pin.startPending = period.capture.pendingCall;
+    pin.caret = period.tokens.size();
+    bool freeName = false;
+    std::set<std::string> periodWords;
+    Walk(G(), pin, [&](const WalkCandidate& c) {
+        if (c.words != nullptr) periodWords.insert(c.words->begin(), c.words->end());
+        else if (c.tokenType == static_cast<size_t>(tsql::ast::TSqlTokenType::Identifier)) freeName = true;
+    });
+    CHECK(!freeName);
+    CHECK(periodWords.count("SYSTEM_TIME") == 1);
+}
+
+// ------------------------------------------------------------------------------- Document
+
+bool SameSpans(const std::vector<tsql::editor::ColouredSpan>& a, const std::vector<tsql::editor::ColouredSpan>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].start != b[i].start || a[i].length != b[i].length || a[i].cls != b[i].cls) return false;
+    return true;
+}
+
+bool SameCompletion(const tsql::editor::CompletionResult& a, const tsql::editor::CompletionResult& b) {
+    if (a.replaceStart != b.replaceStart || a.replaceLength != b.replaceLength || a.items.size() != b.items.size())
+        return false;
+    for (size_t i = 0; i < a.items.size(); ++i)
+        if (a.items[i].kind != b.items[i].kind || a.items[i].label != b.items[i].label ||
+            a.items[i].insertText != b.items[i].insertText || a.items[i].detail != b.items[i].detail)
+            return false;
+    return true;
+}
+
+tsql::editor::Catalog SmallCatalog() {
+    using OT = tsql::editor::CatalogObject::Type;
+    tsql::editor::Catalog c;
+    c.currentDatabase = "Sales";
+    c.databases = {"Sales", "master"};
+    c.objects.push_back({"Sales", "dbo", "Orders", OT::Table, {{"OrderID", "int"}, {"Status", "int"}}, {}, {}});
+    c.objects.push_back({"Sales", "dbo", "usp_Get", OT::Procedure, {}, {{"@id", "int", false, false}}, {}});
+    c.objects.push_back({"", "sys", "objects", OT::View, {{"object_id", "int"}, {"name", "sysname"}}, {}, {}});
+    return c;
+}
+
+/// Edits that make and break statements, batches, comments, strings and brackets.
+const char* const kFragments[] = {
+    "SELECT ", "a", " FROM ", "dbo.Orders", " o", " WHERE ", "o.Status = 1", ";", "\n", "\nGO\n", "GO", "BEGIN ",
+    " END", "(", ")", ",", "'", "'x'", "/*", "*/", "--", "[", "]", "\"", "UPDATE t SET a = 1 ", "SET @x = 2",
+    "DECLARE @x int", "IF 1 = 1 ", "ELSE ", "WITH c AS (SELECT 1 AS n) ", "INSERT INTO t ", "EXEC dbo.usp_Get ",
+    "CREATE VIEW v AS ", "SET QUOTED_IDENTIFIER OFF", "SET QUOTED_IDENTIFIER ON", "\"q\"", "CASE WHEN ", " THEN 1 END",
+    "N'\xC3\xA4'", "\xE2\x82\xAC", "\xFF", "x", " ", "1e", "0x", "$1", "@", "#t", "OPTION (RECOMPILE)",
+};
+
+const char* const kScripts[] = {
+    "SELECT o.OrderID, o.Status FROM dbo.Orders AS o WHERE o.Status = 1 ORDER BY o.OrderID;\n"
+    "UPDATE dbo.Orders SET Status = 2 WHERE OrderID = 1\nSET @x = 1\n"
+    "DECLARE c CURSOR FOR SELECT OrderID FROM dbo.Orders\nGO\n"
+    "IF EXISTS (SELECT 1 FROM sys.objects) BEGIN SELECT 1; SELECT 2 END ELSE SELECT 3\n"
+    "WITH x AS (SELECT 1 AS n) SELECT n FROM x;\nEXEC dbo.usp_Get @id = 1\nGO\nCREATE VIEW v AS SELECT 1 AS a\n",
+    "SET QUOTED_IDENTIFIER OFF\nSELECT \"text\" FROM t\nGO\nSELECT \"col\" FROM t\n/* comment\n spanning */ SELECT 1 -- x\n",
+    "BEGIN TRY\n  INSERT INTO t (a) VALUES (1)\nEND TRY\nBEGIN CATCH\n  THROW\nEND CATCH\nMERGE t USING s ON t.a = s.a "
+    "WHEN MATCHED THEN UPDATE SET a = 1;\n",
+    // an error the script rule does not recover from ends the first batch's parse
+    "SELECT 1;\n)\nGO\nSET NOCOUNT ON\nSELECT o.Status FROM dbo.Orders o\nGO\nGO\nSELECT 2\n",
+};
+
+/// For random edit sequences, a Document's results equal the free functions' on its text.
+void TestDocumentMatchesFreeFunctions() {
+    using namespace tsql::editor;
+    const Catalog catalog = SmallCatalog();
+    uint32_t seed = 12345;
+    auto next = [&](uint32_t n) {
+        seed = seed * 1103515245u + 12345u;
+        return n == 0 ? 0u : (seed >> 8) % n;
+    };
+    int mismatches = 0;
+    for (SqlVersion version : {SqlVersion::Sql170, SqlVersion::Sql130}) {
+        for (const char* script : kScripts) {
+            Document d(version);
+            d.SetText(script);
+            for (int step = 0; step < 60 && mismatches < 5; ++step) {
+                const std::string& text = d.Text();
+                const size_t at = next(static_cast<uint32_t>(text.size() + 1));
+                const size_t remove = next(4) == 0 ? next(static_cast<uint32_t>(std::min<size_t>(12, text.size() - at) + 1)) : 0;
+                const char* insert = next(5) == 0 ? "" : kFragments[next(sizeof(kFragments) / sizeof(kFragments[0]))];
+                d.Edit(at, remove, insert);
+                const std::string now = d.Text();
+                // query in an order that leaves parts unparsed: a viewport, a caret, everything
+                const size_t vs = next(static_cast<uint32_t>(now.size() + 1));
+                const size_t ve = std::min(now.size(), vs + next(80));
+                const auto full = Classify(now, version);
+                std::vector<ColouredSpan> expected;
+                for (const auto& s : full)   // an empty range overlaps nothing
+                    if (vs < ve && s.start < ve && s.start + s.length > vs) expected.push_back(s);
+                std::string what;
+                if (!SameSpans(d.Classify(vs, ve), expected)) what += " viewport Classify";
+                const size_t caret = next(static_cast<uint32_t>(now.size() + 1));
+                const CompletionResult got = d.Complete(caret, catalog), want = Complete(now, caret, version, catalog);
+                if (!SameCompletion(got, want))
+                    what += " Complete (" + std::to_string(got.items.size()) + " items, not " +
+                            std::to_string(want.items.size()) + ")";
+                if (step % 3 == 0 && !SameSpans(d.Classify(0, now.size()), full)) what += " full Classify";
+                if (!what.empty()) {
+                    ++mismatches;
+                    std::printf("%s: Document differs from the free functions in%s after %d edits (last: %zu,%zu,'%s'), "
+                                "viewport [%zu,%zu), caret %zu:\n%s\n",
+                                GrammarName(version), what.c_str(), step + 1, at, remove, insert, vs, ve, caret, now.c_str());
+                }
+            }
+        }
+    }
+    CHECK_EQ(mismatches, 0);
+}
+
+/// After edits, a Buffer's tokens are those of a fresh lex of its text.
+void TestIncrementalLex() {
+    Buffer b(G());
+    std::string text = kScripts[0];
+    b.SetText(text);
+    uint32_t seed = 777;
+    auto next = [&](uint32_t n) {
+        seed = seed * 1103515245u + 12345u;
+        return n == 0 ? 0u : (seed >> 8) % n;
+    };
+    int mismatches = 0;
+    for (int step = 0; step < 400; ++step) {
+        const size_t at = next(static_cast<uint32_t>(text.size() + 1));
+        const size_t remove = next(3) == 0 ? std::min<size_t>(next(20), text.size() - at) : 0;
+        const std::string insert = next(4) == 0 ? "" : kFragments[next(sizeof(kFragments) / sizeof(kFragments[0]))];
+        b.Edit(at, remove, insert);
+        text.replace(at, remove, insert);
+        std::vector<LexToken> fresh;
+        G().Lex(text, fresh);
+        const auto& kept = b.Tokens();
+        bool same = kept.size() == fresh.size() && b.Text() == text;
+        for (size_t i = 0; same && i < kept.size(); ++i)
+            same = kept[i].type == fresh[i].type && kept[i].start == fresh[i].start && kept[i].end == fresh[i].end;
+        if (!same && ++mismatches <= 3) std::printf("tokens differ after edit %zu,%zu,'%s':\n%s\n", at, remove, insert.c_str(), text.c_str());
+        // the parser-visible tokens (kept up to date by the edit once built) equal those of the fresh lex
+        const std::vector<LexToken>& visible = b.Visible();
+        const std::vector<uint32_t>& toToken = b.VisibleToToken();
+        size_t v = 0;
+        bool sameVisible = visible.size() == toToken.size();
+        for (size_t i = 0; sameVisible && i < fresh.size(); ++i) {
+            if (IsHiddenType(fresh[i].type)) continue;
+            sameVisible = v < visible.size() && toToken[v] == i && visible[v].type == fresh[i].type &&
+                          visible[v].start == fresh[i].start && visible[v].end == fresh[i].end;
+            ++v;
+        }
+        if (!sameVisible || v != visible.size()) ++mismatches;
+    }
+    CHECK_EQ(mismatches, 0);
+}
+
+/// A long script: a viewport or a caret after an edit is parsed again near the edit only.
+void TestDocumentReusesTheParse() {
+    using namespace tsql::editor;
+    std::string script;
+    for (int i = 0; i < 400; ++i) script += "SELECT o.OrderID FROM dbo.Orders AS o WHERE o.Status = " + std::to_string(i) + ";\n";
+    const Catalog catalog = SmallCatalog();
+    Document d(SqlVersion::Sql170);
+    d.SetText(script);
+    CHECK(SameSpans(d.Classify(0, script.size()), Classify(script, SqlVersion::Sql170)));
+    const size_t at = script.find("= 200;") + 2;
+    d.Edit(at, 3, "x.");
+    const std::string now = d.Text();
+    CHECK(SameCompletion(d.Complete(at + 2, catalog), Complete(now, at + 2, SqlVersion::Sql170, catalog)));
+    CHECK(SameSpans(d.Classify(0, now.size()), Classify(now, SqlVersion::Sql170)));
+}
+
+/// Each batch after a GO is parsed on its own: also after an error that ends the script rule's
+/// parse of an earlier batch, and a query in a later batch does not parse the batches before it.
+void TestBatchesParsedIndependently() {
+    using namespace tsql::editor;
+    const std::string sql = "SELECT 1;\n)\nGO\nSET NOCOUNT ON";
+    bool keyword = false;
+    for (const ColouredSpan& s : Classify(sql, SqlVersion::Sql170))
+        if (sql.substr(s.start, s.length) == "NOCOUNT") keyword = s.cls == TokenClass::Keyword;
+    CHECK(keyword);
+    // the GO taken out: the merged batch's parse ends at ')' again and NOCOUNT stays untaken
+    Document d(SqlVersion::Sql170);
+    d.SetText(sql);
+    d.Classify(0, sql.size());
+    d.Edit(sql.find("GO"), 3, "");
+    CHECK(SameSpans(d.Classify(0, d.Text().size()), Classify(d.Text(), SqlVersion::Sql170)));
+
+    std::string script;
+    for (int i = 0; i < 50; ++i) script += "SELECT o.Status FROM dbo.Orders AS o\nGO\n";
+    Buffer b(G());
+    b.SetText(script);
+    const size_t o = b.Tokens().size() - 4;   // the last batch's o (then newline, GO, newline)
+    b.EnsureParsed(o, o + 1);
+    CHECK(b.Roles()[o].state >= 0);
+    CHECK_EQ(b.Roles()[0].state, -1);         // the first batch's SELECT: not parsed
+    CHECK(b.ResumeAtOrBefore(o).kind == ResumePoint::Kind::InBatch);
+}
+
+/// Warm on some threads while Documents of the same and other versions are used on others.
+void TestWarmConcurrently() {
+    using namespace tsql::editor;
+    const Catalog catalog = SmallCatalog();
+    std::vector<SqlVersion> versions;
+    for (SqlVersion v : {SqlVersion::Sql130, SqlVersion::Sql140, SqlVersion::Sql150, SqlVersion::Sql160,
+                         SqlVersion::Sql170, SqlVersion::Sql180, SqlVersion::SqlFabricDW})
+        if (IsParserAvailable(v)) versions.push_back(v);
+    // what each Document must produce, computed up front on this thread
+    struct Expected {
+        SqlVersion version;
+        std::string text;
+        std::vector<ColouredSpan> spans;
+        CompletionResult completion;
+    };
+    std::vector<Expected> expected;
+    for (SqlVersion v : versions)
+        for (const char* s : kScripts) {
+            const std::string text = s;
+            expected.push_back({v, text, Classify(text, v), Complete(text, text.size() / 2, v, catalog)});
+        }
+    std::atomic<int> wrong{0};
+    std::vector<std::thread> threads;
+    for (size_t t = 0; t < 4; ++t)
+        threads.emplace_back([&, t] {
+            for (size_t k = t; k < versions.size() * 2; k += 4) Warm(versions[k % versions.size()]);
+        });
+    for (size_t t = 0; t < 4; ++t)
+        threads.emplace_back([&, t] {
+            for (int round = 0; round < 3; ++round)
+                for (size_t k = t; k < expected.size(); k += 4) {
+                    const Expected& e = expected[k];
+                    Document d(e.version);
+                    d.SetText(e.text);
+                    if (!SameCompletion(d.Complete(e.text.size() / 2, catalog), e.completion)) ++wrong;
+                    d.Edit(0, 0, " ");
+                    d.Edit(0, 1, "");
+                    if (!SameSpans(d.Classify(0, e.text.size()), e.spans)) ++wrong;
+                }
+        });
+    for (std::thread& t : threads) t.join();
+    CHECK_EQ(wrong.load(), 0);
 }
 
 void TestEdges() {
@@ -300,6 +566,30 @@ void TestEdges() {
     CHECK(threw);
 }
 
+/// A syntax error inside a CREATE OR ALTER PROCEDURE body made the parser dereference the null
+/// statement it builds for it (createOrAlterStatements): Complete, Classify and a Document over
+/// such text must work and still complete the columns of the statement at the caret.
+void TestErrorInCreateOrAlterBody() {
+    using namespace tsql::editor;
+    const Catalog catalog = SmallCatalog();
+    const std::string sql = "CREATE OR ALTER PROCEDURE dbo.p AS SELECT 1 FROM dbo.Orders o WHERE o.| GROUP BY c";
+    const size_t caret = sql.find('|');
+    std::string text = sql;
+    text.erase(caret, 1);
+    for (SqlVersion v : {SqlVersion::Sql130, SqlVersion::Sql140, SqlVersion::Sql150, SqlVersion::Sql160,
+                         SqlVersion::Sql170, SqlVersion::Sql180, SqlVersion::SqlFabricDW}) {
+        if (!IsParserAvailable(v)) continue;
+        const CompletionResult r = Complete(text, caret, v, catalog);
+        CHECK(std::any_of(r.items.begin(), r.items.end(),
+                          [](const CompletionItem& i) { return i.kind == CompletionKind::Column && i.label == "Status"; }));
+        CHECK(!Classify(text, v).empty());
+        Document doc(v);
+        doc.SetText(text);
+        CHECK_EQ(doc.Complete(caret, catalog).items.size(), r.items.size());
+        CHECK(!doc.Classify(0, text.size()).empty());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -312,6 +602,12 @@ int main() {
     TestScopeQueries();
     TestCapture();
     TestEdges();
+    TestErrorInCreateOrAlterBody();
+    TestIncrementalLex();
+    TestDocumentMatchesFreeFunctions();
+    TestDocumentReusesTheParse();
+    TestBatchesParsedIndependently();
+    TestWarmConcurrently();
     if (failures != 0) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

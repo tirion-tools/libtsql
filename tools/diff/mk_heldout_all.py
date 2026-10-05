@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Per-version gate corpora from the source-built oracle's full-corpus dumps
-(/tmp/tsql-pilot/oracle-<V>, SqlScriptDOM @ eaf3a6e, `oracle dump --parser <V>` + `oracle classify`):
+($P/oracle-<V>, P = workspace.P, SqlScriptDOM @ eaf3a6e, `oracle dump --parser <V>` + `oracle classify`):
 
     tools/diff/mk_heldout_all.py --version TSql160 [--version ...]   (default: every version)
 
@@ -14,7 +14,7 @@ writes, for each version V:
 Statements are cut out by the oracle's StartOffset/FragmentLength (UTF-16 units)."""
 import argparse, hashlib, json, os, shutil, subprocess
 
-P = '/tmp/tsql-pilot'
+from workspace import P
 ORACLE = P + '/build-OracleSrc/bin/Release/net10.0/oracle'
 VERSIONS = ['TSql130', 'TSql140', 'TSql150', 'TSql160', 'TSql170', 'TSql180', 'TSqlFabricDW']
 
