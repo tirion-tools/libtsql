@@ -1,0 +1,8 @@
+<Project>
+  <!-- Keep build output out of the source tree. Override with -p:OracleBuildRoot=... -->
+  <PropertyGroup>
+    <OracleBuildRoot Condition="'$(OracleBuildRoot)' == ''">/tmp/tsql-pilot/build-Oracle</OracleBuildRoot>
+    <BaseIntermediateOutputPath>$(OracleBuildRoot)/obj/</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(OracleBuildRoot)/bin/</BaseOutputPath>
+  </PropertyGroup>
+</Project>

@@ -36,6 +36,17 @@ if(TSQL_BUILD_TESTS)
     add_test(NAME tsql_lexer COMMAND test_lexer)
 endif()
 
+# ANTLR 4 parser pilot (branch antlr4-pilot): AST generated from SqlScriptDOM's Ast.xml and
+# parsers converted from its TSql<ver>.g grammars, both at build time. Fetches its pinned inputs
+# (SqlScriptDOM, ANTLR 4 tool and C++ runtime) and needs Python 3 and Java; see
+# cmake/TsqlParserPilot.cmake.
+option(TSQL_BUILD_PARSER_PILOT "Build the ANTLR 4 parser pilot" OFF)
+if(TSQL_BUILD_PARSER_PILOT)
+    include(cmake/TsqlParserPilot.cmake)
+    add_subdirectory(src/ast)
+    add_subdirectory(src/parser)
+endif()
+
 if(TSQL_INSTALL)
     include(GNUInstallDirs)
     install(TARGETS tsql EXPORT tsqlTargets

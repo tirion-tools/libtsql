@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>oracle</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Pinned: the oracle reported in the pilot uses 180.117.0. Override only for gap checks
+         (e.g. -p:ScriptDomVersion=180.102.0 -p:OracleBuildRoot=/tmp/...). -->
+    <ScriptDomVersion Condition="'$(ScriptDomVersion)' == ''">180.117.0</ScriptDomVersion>
+  </PropertyGroup>
+
+  <!--
+    Exact pin. 180.117.0 (published 2026-09-23) is the newest package; its nuspec records internal
+    commit e3e282510b9d (not on public GitHub). Reference source is public master eaf3a6e (2026-09-30),
+    whose last release sync is 180.102.0 (b583737) plus #212 (Fabric query hints), which 180.117.0 lacks.
+  -->
+  <ItemGroup Condition="'$(ScriptDomDll)' == ''">
+    <PackageReference Include="Microsoft.SqlServer.TransactSql.ScriptDom" Version="[$(ScriptDomVersion)]" />
+  </ItemGroup>
+
+  <!--
+    -p:ScriptDomDll=<path to Microsoft.SqlServer.TransactSql.ScriptDom.dll> uses a ScriptDom built from the
+    reference source instead (SqlScriptDom/Microsoft.SqlServer.TransactSql.ScriptDom.csproj, -f net8.0;
+    its build needs java and pwsh on PATH and DOTNET_ROLL_FORWARD=Major when only a newer runtime exists).
+  -->
+  <ItemGroup Condition="'$(ScriptDomDll)' != ''">
+    <Reference Include="Microsoft.SqlServer.TransactSql.ScriptDom">
+      <HintPath>$(ScriptDomDll)</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

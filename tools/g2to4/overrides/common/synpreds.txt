@@ -1,0 +1,6 @@
+# ANTLR 2 syntactic predicates kept as speculative parses: `rule N` = the N-th `(...)=>` of the rule
+# (applies to every grammar that has the rule; overrides/<G>/synpreds.txt adds grammar-specific ones).
+# The others are dropped: ANTLR 4's unbounded lookahead picks the same alternative. These stay
+# because the predicate is stricter than its alternative (only a prefix is checked), so both
+# alternatives can match the whole input:
+schemaObjectDmlTarget 1   # INSERT t (c1) SELECT ...: a function target only if `(` is followed by a constant or `)`

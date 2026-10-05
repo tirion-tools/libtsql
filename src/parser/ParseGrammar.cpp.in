@@ -1,0 +1,13 @@
+// Ported from Microsoft SqlScriptDOM (MIT) @ eaf3a6e: SqlScriptDom/Parser/TSql/@G@Parser.cs (Parse)
+// Configured by src/parser/CMakeLists.txt from ParseGrammar.cpp.in: the parse driver for @G@.
+#include "ParseDriver.h"
+#include "generated/@G@/@G@Lexer.h"
+#include "generated/@G@/@G@Parser.h"
+
+namespace tsql::detail {
+
+ParseResult Parse@G@(std::string_view sql, bool initialQuotedIdentifiers) {
+    return ParseWith<parser::@G@Lexer, parser::@G@Parser>(sql, SqlVersion::@V@, initialQuotedIdentifiers);
+}
+
+}  // namespace tsql::detail
