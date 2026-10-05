@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "Fixture catalog for tests/editor (tsql::editor::Catalog). A small performance-tuning shaped schema:",
+    "several databases and schemas, names that need quoting (spaces, reserved words, ']' inside, leading digit),",
+    "a non-ASCII name that needs no quoting (Umsätze; UTF-8 offsets),",
+    "views, scalar and table-valued functions, procedures. columns: [name, type] pairs; only tables,",
+    "views and table functions have columns. Changing names here affects completion_cases.json."
+  ],
+  "currentDatabase": "SalesDb",
+  "defaultSchema": "dbo",
+  "databases": ["SalesDb", "Warehouse", "Reporting", "Sales-Archive", "master", "tempdb"],
+  "objects": [
+    {"database": "SalesDb", "schema": "dbo", "name": "Customers", "type": "Table", "columns": [
+      ["CustomerID", "int"], ["CustomerName", "nvarchar(100)"], ["Region", "nvarchar(50)"],
+      ["CreatedAt", "datetime2(3)"], ["IsActive", "bit"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "Orders", "type": "Table", "columns": [
+      ["OrderID", "int"], ["CustomerID", "int"], ["OrderDate", "datetime2(3)"], ["Status", "tinyint"],
+      ["TotalDue", "money"], ["SalesPersonID", "int"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "Order Details", "type": "Table", "columns": [
+      ["OrderID", "int"], ["ProductID", "int"], ["Quantity", "int"], ["UnitPrice", "money"],
+      ["Discount", "decimal(4,2)"], ["Line Total", "money"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "Products", "type": "Table", "columns": [
+      ["ProductID", "int"], ["ProductName", "nvarchar(200)"], ["CategoryID", "int"], ["ListPrice", "money"],
+      ["Discontinued", "bit"], ["Weight (kg)", "decimal(9,3)"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "Group", "type": "Table", "columns": [
+      ["GroupID", "int"], ["Key", "nvarchar(50)"], ["Order", "int"], ["Name", "nvarchar(100)"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "vw_OrderSummary", "type": "View", "columns": [
+      ["OrderID", "int"], ["CustomerName", "nvarchar(100)"], ["OrderTotal", "money"], ["LineCount", "int"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "fn_OrderTotal", "type": "ScalarFunction", "columns": []},
+    {"database": "SalesDb", "schema": "dbo", "name": "fn_OrdersByCustomer", "type": "TableFunction", "columns": [
+      ["OrderID", "int"], ["OrderDate", "datetime2(3)"], ["TotalDue", "money"]]},
+    {"database": "SalesDb", "schema": "dbo", "name": "usp_GetOrders", "type": "Procedure", "columns": []},
+    {"database": "SalesDb", "schema": "dbo", "name": "usp_RefreshStats", "type": "Procedure", "columns": []},
+    {"database": "SalesDb", "schema": "sales", "name": "Invoices", "type": "Table", "columns": [
+      ["InvoiceID", "int"], ["OrderID", "int"], ["InvoiceDate", "date"], ["Amount", "money"],
+      ["PaidAt", "datetime2(0)"]]},
+    {"database": "SalesDb", "schema": "sales", "name": "SalesPeople", "type": "Table", "columns": [
+      ["SalesPersonID", "int"], ["FullName", "nvarchar(100)"], ["Territory", "nvarchar(50)"], ["Quota", "money"]]},
+    {"database": "SalesDb", "schema": "sales", "name": "vw_TopCustomers", "type": "View", "columns": [
+      ["CustomerID", "int"], ["CustomerName", "nvarchar(100)"], ["Revenue", "money"]]},
+    {"database": "SalesDb", "schema": "sales", "name": "fn_Commission", "type": "ScalarFunction", "columns": []},
+    {"database": "SalesDb", "schema": "sales", "name": "usp_CloseInvoice", "type": "Procedure", "columns": []},
+    {"database": "SalesDb", "schema": "hr", "name": "Employees", "type": "Table", "columns": [
+      ["EmployeeID", "int"], ["ManagerID", "int"], ["FullName", "nvarchar(100)"], ["HireDate", "date"],
+      ["Title", "nvarchar(50)"]]},
+    {"database": "SalesDb", "schema": "staging", "name": "ProductFeed", "type": "Table", "columns": [
+      ["ProductID", "int"], ["ProductName", "nvarchar(200)"], ["ListPrice", "money"], ["FeedDate", "datetime2"],
+      ["Raw]Value", "nvarchar(max)"]]},
+    {"database": "Warehouse", "schema": "dbo", "name": "StockLevels", "type": "Table", "columns": [
+      ["ProductID", "int"], ["WarehouseID", "int"], ["OnHand", "int"], ["ReorderPoint", "int"]]},
+    {"database": "Warehouse", "schema": "dbo", "name": "vw_LowStock", "type": "View", "columns": [
+      ["ProductID", "int"], ["OnHand", "int"]]},
+    {"database": "Warehouse", "schema": "dbo", "name": "usp_Restock", "type": "Procedure", "columns": []},
+    {"database": "Warehouse", "schema": "inv", "name": "Bins", "type": "Table", "columns": [
+      ["BinID", "int"], ["WarehouseID", "int"], ["Aisle", "nvarchar(10)"]]},
+    {"database": "Reporting", "schema": "dbo", "name": "DailySales", "type": "Table", "columns": [
+      ["SalesDate", "date"], ["Region", "nvarchar(50)"], ["Revenue", "money"]]},
+    {"database": "Reporting", "schema": "dbo", "name": "2024Targets", "type": "Table", "columns": [
+      ["Region", "nvarchar(50)"], ["Target", "money"]]},
+    {"database": "Reporting", "schema": "dbo", "name": "Umsätze", "type": "Table", "columns": [
+      ["Jahr", "int"], ["Betrag", "money"]]},
+    {"database": "Sales-Archive", "schema": "dbo", "name": "OrdersArchive", "type": "Table", "columns": [
+      ["OrderID", "int"], ["ArchivedAt", "datetime2"]]}
+  ]
+}

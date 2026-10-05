@@ -153,7 +153,12 @@ bool PrepareTokens(parser::TSqlLexerBase& lexer, antlr4::CommonTokenStream& stre
         r.script->ScriptTokenStream = nullptr;
         return false;
     }
+    BuildScriptTokens(stream, d, initialQuotedIdentifiers, r);
+    return true;
+}
 
+void BuildScriptTokens(antlr4::CommonTokenStream& stream, const Decoded& d, bool initialQuotedIdentifiers,
+                       ParseResult& r) {
     // ---- script token stream with SqlScriptDOM positions; parser-facing token types
     const auto& all = stream.getTokens();
     r.tokens->reserve(all.size());
@@ -183,8 +188,6 @@ bool PrepareTokens(parser::TSqlLexerBase& lexer, antlr4::CommonTokenStream& stre
         r.tokens->push_back(std::move(pt));
     }
     r.factory->SetTokenStream(r.tokens.get());
-
-    return true;
 }
 
 std::vector<std::unique_ptr<antlr4::Token>> VisibleTokens(const std::vector<antlr4::Token*>& all) {

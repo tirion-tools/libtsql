@@ -1,0 +1,19 @@
+// Configured by src/editor/CMakeLists.txt from EditorGrammar.cpp.in: the editor-support Grammar of @G@.
+#include "GrammarImpl.h"
+#include "generated/@G@/@G@Lexer.h"
+#include "generated/@G@/@G@Parser.h"
+
+namespace tsql::editor::detail {
+
+namespace {
+#include "editor_meta_@G@.inc"
+}  // namespace
+
+const Grammar& EditorGrammar@G@() {
+    static const GrammarImpl<parser::@G@Lexer, parser::@G@Parser> grammar(
+        SqlVersion::@V@, @FLAG@, kKeywordStates, sizeof(kKeywordStates) / sizeof(kKeywordStates[0]), kPredicates,
+        sizeof(kPredicates) / sizeof(kPredicates[0]));
+    return grammar;
+}
+
+}  // namespace tsql::editor::detail

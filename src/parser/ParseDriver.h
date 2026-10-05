@@ -46,6 +46,10 @@ public:
 /// Returns false after a lexer error: `r` then holds the empty script and the error.
 bool PrepareTokens(parser::TSqlLexerBase& lexer, antlr4::CommonTokenStream& stream, const Decoded& d,
                    bool initialQuotedIdentifiers, ParseResult& r);
+/// PrepareTokens without the lexer-error check: fills r.tokens from `stream` and makes the
+/// whitespace and comment tokens hidden (the editor support parses past lexer errors).
+void BuildScriptTokens(antlr4::CommonTokenStream& stream, const Decoded& d, bool initialQuotedIdentifiers,
+                       ParseResult& r);
 
 /// The parser-facing token list: default-channel tokens keeping their full-stream indexes.
 std::vector<std::unique_ptr<antlr4::Token>> VisibleTokens(const std::vector<antlr4::Token*>& all);

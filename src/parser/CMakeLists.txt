@@ -3,8 +3,8 @@
 set(TSQL_PARSER_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
 # Which grammars to build: any of the SqlScriptDOM parsers below (tsql::parse throws
-# std::invalid_argument for the others). Each full parser takes about a minute and ~1.4 GB per
-# translation unit to compile.
+# std::invalid_argument for the others). Each full parser takes about a minute to compile, and each
+# of its rule translation units needs up to ~1.4 GB.
 set(TSQL_PARSER_ALL_GRAMMARS TSql130 TSql140 TSql150 TSql160 TSql170 TSql180 TSqlFabricDW)
 set(TSQL_PARSER_GRAMMARS "${TSQL_PARSER_ALL_GRAMMARS}" CACHE STRING
     "Semicolon-separated SqlScriptDOM grammars to build (subset of: ${TSQL_PARSER_ALL_GRAMMARS})")
@@ -13,6 +13,22 @@ if(NOT TSQL_PARSER_GRAMMARS)
 endif()
 set(TSQL_PARSER_PARTS 5 CACHE STRING
     "Translation units each generated parser's rules are split into (plus one for its ATN data)")
+
+# Compiling many parser translation units at once can exhaust memory, so with Ninja they share a
+# job pool sized to half the memory free at configure time (1.6 GB per job). Other generators
+# follow their own -j.
+set(TSQL_PARSER_COMPILE_JOBS "" CACHE STRING
+    "Concurrent tsql_parser compiles with Ninja (empty: half the free memory at configure time / 1.6 GB)")
+set(parser_compile_jobs ${TSQL_PARSER_COMPILE_JOBS})
+if(NOT parser_compile_jobs)
+    cmake_host_system_information(RESULT free_mib QUERY AVAILABLE_PHYSICAL_MEMORY)
+    math(EXPR parser_compile_jobs "${free_mib} / 2 / 1600")
+    if(parser_compile_jobs LESS 1)
+        set(parser_compile_jobs 1)
+    endif()
+endif()
+set_property(GLOBAL APPEND PROPERTY JOB_POOLS tsql_parser_compile=${parser_compile_jobs})
+message(STATUS "tsql_parser compile jobs: ${parser_compile_jobs}")
 
 # ---- code generation (each step rewrites a file only when its content changes, so editing an
 #      input re-runs the steps that read it but recompiles only what actually changed)
@@ -129,6 +145,7 @@ add_library(tsql_parser STATIC
     Parse.cpp
 )
 add_dependencies(tsql_parser tsql_parser_generate)
+set_property(TARGET tsql_parser PROPERTY JOB_POOL_COMPILE tsql_parser_compile)
 add_library(tsql::parser ALIAS tsql_parser)
 target_include_directories(tsql_parser
     PUBLIC ${TSQL_PARSER_ROOT}/include
