@@ -531,7 +531,9 @@ int Usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);  // keep the reports of earlier cases if one crashes
+    // Unbuffered, to keep the reports of earlier cases if one crashes. (Line buffering with size 0 is
+    // an invalid parameter to MSVC's CRT, which has no line buffering and fails fast on it.)
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     bool validateOnly = false, verbose = false;
     std::string suite = "all", filter, dir, asVersionName;
     for (int i = 1; i < argc; ++i) {
