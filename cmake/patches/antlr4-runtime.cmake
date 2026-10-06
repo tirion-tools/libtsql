@@ -46,3 +46,9 @@ tsql_patch(runtime/Cpp/runtime/src/tree/xpath/XPathLexer.cpp
 tsql_patch(runtime/Cpp/runtime/src/atn/ProfilingATNSimulator.cpp
     "#include \"support/CPPUtils.h\"\n\n#include \"atn/ProfilingATNSimulator.h\"\n"
     "#include \"support/CPPUtils.h\"\n\n#include <chrono> // [libtsql] used below; MSVC's headers do not include it transitively\n\n#include \"atn/ProfilingATNSimulator.h\"\n")
+
+# MSVC C4244: the int literals in Utf8.cpp's std::pair<uint8_t, uint8_t> table go through pair's
+# converting constructor, which narrows inside <utility>. The same values as uint8_t ({} is {0, 0}).
+tsql_patch(runtime/Cpp/runtime/src/support/Utf8.cpp
+    "      {LOW, HIGH}, {0xa0, HIGH}, {LOW, 0x9f}, {0x90, HIGH},\n      {LOW, 0x8f}, {0x0, 0x0},   {0x0, 0x0},  {0x0, 0x0},\n      {0x0, 0x0},  {0x0, 0x0},   {0x0, 0x0},  {0x0, 0x0},\n      {0x0, 0x0},  {0x0, 0x0},   {0x0, 0x0},  {0x0, 0x0},\n"
+    "      // [libtsql] uint8_t values: int literals narrowed inside std::pair's constructor (MSVC C4244)\n      {LOW, HIGH}, {uint8_t{0xa0}, HIGH}, {LOW, uint8_t{0x9f}}, {uint8_t{0x90}, HIGH},\n      {LOW, uint8_t{0x8f}}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},\n")

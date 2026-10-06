@@ -38,10 +38,12 @@ set(ANTLR_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ANTLR_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(WITH_DEMO OFF CACHE BOOL "" FORCE)
 set(ANTLR4_INSTALL OFF CACHE BOOL "" FORCE)
-# The patch runs once per population of the source (an edit to the script changes its hash in the
-# command, which re-runs it). FETCHCONTENT_SOURCE_DIR_TSQL_ANTLR4 skips patching: a source given
-# that way must already carry cmake/patches/antlr4-runtime.cmake (cmake -P it in that directory).
+# The patch runs once per population of the source. The script is a configure dependency and its
+# hash is in the patch command, so editing it re-runs CMake, which re-runs the patch on the existing
+# source. FETCHCONTENT_SOURCE_DIR_TSQL_ANTLR4 skips patching: a source given that way must already
+# carry cmake/patches/antlr4-runtime.cmake (cmake -P it in that directory).
 set(_tsql_antlr_patch ${CMAKE_CURRENT_LIST_DIR}/patches/antlr4-runtime.cmake)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_tsql_antlr_patch})
 file(SHA256 ${_tsql_antlr_patch} _tsql_antlr_patch_hash)
 FetchContent_Declare(tsql_antlr4
     URL https://github.com/antlr/antlr4/archive/refs/tags/${TSQL_ANTLR_VERSION}.tar.gz
