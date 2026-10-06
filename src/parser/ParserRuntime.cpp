@@ -13,6 +13,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#if defined(_M_X64) || defined(_M_IX86)
+#include <xmmintrin.h>
+#endif
+#endif
+
 namespace tsql::parser {
 
 // ============================================================================ error strategy
@@ -99,6 +106,32 @@ inline size_t Popcount(uint64_t x) {
     x = (x & 0x3333333333333333) + (x >> 2 & 0x3333333333333333);
     x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F;
     return static_cast<size_t>(x * 0x0101010101010101 >> 56);
+}
+
+/// Index of the lowest set bit of a non-zero x.
+inline size_t CountTrailingZeros(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return static_cast<size_t>(__builtin_ctzll(x));
+#elif defined(_MSC_VER) && defined(_M_X64)
+    unsigned long index;
+    _BitScanForward64(&index, x);
+    return index;
+#else
+    size_t n = 0;
+    for (; (x & 1) == 0; x >>= 1) ++n;
+    return n;
+#endif
+}
+
+/// Cache hint: loads the line holding p ahead of use. Changes timing only, never results.
+inline void Prefetch(const void* p) {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(p);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(static_cast<const char*>(p), _MM_HINT_T0);
+#else
+    (void)p;
+#endif
 }
 
 /// Calls f(t) for each token type 1..maxToken that `tr` consumes (as Transition::matches decides).
@@ -578,7 +611,7 @@ const TSqlParserATNSimulator::Antlr2Decision& TSqlParserATNSimulator::Antlr2Deci
         if (set.eof) f(ByToken::Index(antlr4::Token::EOF));
         for (size_t w = 0; w < set.bits.size(); ++w)
             for (uint64_t b = set.bits[w]; b != 0; b &= b - 1)
-                if (const size_t t = w * 64 + static_cast<size_t>(__builtin_ctzll(b)); t <= maxToken)
+                if (const size_t t = w * 64 + CountTrailingZeros(b); t <= maxToken)
                     f(ByToken::Index(t));
     };
     auto addTo = [](uint16_t* bits) {
@@ -817,7 +850,7 @@ size_t TSqlParserATNSimulator::adaptivePredict(antlr4::TokenStream* input, size_
     size_t la1 = 0;   // LA(1) once read (no token has type 0)
     if (tests != nullptr) {
         la1 = input->LA(1);
-        __builtin_prefetch(tests + ByToken::Index(la1));
+        Prefetch(tests + ByToken::Index(la1));
     }
     size_t alt = ATN::INVALID_ALT_NUMBER;
     {
@@ -875,7 +908,7 @@ size_t TSqlParserATNSimulator::adaptivePredict(antlr4::TokenStream* input, size_
         if (isDirect | (loop & (alt == exitAlt) & (f == 0)) | (plain & !depth2)) return alt;
         if (plain) {
             const uint16_t* look2 = ByToken::Look2(tests, antlr2_->maxToken, f - 1);
-            __builtin_prefetch(look2);
+            Prefetch(look2);
             la2 = input->LA(2);
             if (ByToken::Test(look2, ByToken::Index(la2))) return alt;
         }

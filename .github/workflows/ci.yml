@@ -1,0 +1,51 @@
+# Builds libtsql with the parsers and the editor layer and runs ctest.
+#   windows-msvc: the way Calliper's Windows release builds it (Visual Studio generator, MSVC,
+#                 static runtime, Release).
+#   linux-gcc:    Ninja + GCC.
+# The parser build fetches pinned SqlScriptDOM sources and the ANTLR 4.13.2 tool and runtime, and
+# needs Java 11+ and Python 3 (both on the runner images).
+name: ci
+
+on:
+  push:
+    branches: [master, antlr4-pilot]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-msvc:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      # Test scripts are compared by byte offset; keep them byte-for-byte as committed.
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure
+        run: |
+          $env:JAVA_HOME = $env:JAVA_HOME_21_X64
+          $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+          cmake -S . -B build -DTSQL_BUILD_PARSER_PILOT=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  linux-gcc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTSQL_BUILD_PARSER_PILOT=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
