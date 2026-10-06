@@ -29,17 +29,17 @@ def fresh(path):
 
 
 def write_list(path, names):
-    open(path, 'w').write(''.join(n + '\n' for n in names))
+    open(path, 'w', encoding='utf-8', newline='\n').write(''.join(n + '\n' for n in names))
 
 
 def select_rel():
-    corpus = [l.rstrip('\n') for l in open(P + '/oracle-dumps/select-corpus.txt')]
+    corpus = [l.rstrip('\n') for l in open(P + '/oracle-dumps/select-corpus.txt', encoding='utf-8')]
     write_list(P + '/select-rel.txt', [c[len(R) + 1:] if c.startswith(R + '/') else c for c in corpus])
 
 
 def heldout():
-    idx = json.load(open(P + '/oracle-dumps/index.json'))
-    sel = set(l.strip() for l in open(P + '/select-rel.txt'))
+    idx = json.load(open(P + '/oracle-dumps/index.json', encoding='utf-8'))
+    sel = set(l.strip() for l in open(P + '/select-rel.txt', encoding='utf-8'))
     out = P + '/heldout'
     fresh(out)
     enc_map = {'utf-8': 'utf-8', 'utf-8-bom': 'utf-8-sig', 'utf-16-bom': 'utf-16'}
@@ -51,7 +51,7 @@ def heldout():
         if not enc:
             continue
         u16 = open(e['source'], encoding=enc).read().encode('utf-16-le')
-        d = json.load(open('%s/oracle-dumps/%s.json' % (P, e['path'])))
+        d = json.load(open('%s/oracle-dumps/%s.json' % (P, e['path']), encoding='utf-8'))
         for b in d['tree']['Batches']:
             for s in b['Statements']:
                 if s['$type'] != 'SelectStatement':
@@ -62,7 +62,7 @@ def heldout():
                 if h in seen:
                     continue
                 seen.add(h)
-                open('%s/%s.sql' % (out, h), 'w', encoding='utf-8').write(frag)
+                open('%s/%s.sql' % (out, h), 'w', encoding='utf-8', newline='').write(frag)
     write_list(P + '/ho-list.txt', sorted(os.listdir(out)))
     return len(seen)
 
@@ -70,7 +70,7 @@ def heldout():
 def big():
     parts = [open(f, encoding='utf-8').read() for f in sorted(glob.glob(P + '/heldout/*.sql'))]
     one = '\nGO\n'.join(parts) + '\n'
-    open(P + '/bench-big.sql', 'w', encoding='utf-8').write(one * 8)
+    open(P + '/bench-big.sql', 'w', encoding='utf-8', newline='').write(one * 8)
     text = open(P + '/bench-big.sql', 'rb').read()
     open(P + '/bench-big-err.sql', 'wb').write(text + b'\nSELECT FROM WHERE\n')
     open(P + '/bench-big-err-start.sql', 'wb').write(b'SELECT FROM WHERE\nGO\n' + text)
@@ -103,7 +103,7 @@ def mut():
                 t = text[:b] + ' ' + text[a:b] + text[b:]
             else:
                 t = text[:a] + rnd.choice(inserts) + ' ' + text[a:]
-            open('%s/%s_%s.sql' % (out, base, kind), 'w', encoding='utf-8').write(t)
+            open('%s/%s_%s.sql' % (out, base, kind), 'w', encoding='utf-8', newline='').write(t)
     names = sorted(os.listdir(out))
     write_list(P + '/mut-list.txt', names)
     return len(names)

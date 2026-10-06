@@ -775,7 +775,7 @@ def main():
     out = '\n'.join(lines) + '\n'
     if not os.path.exists(a.out) or open(a.out, encoding='utf-8').read() != out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, 'w', encoding='utf-8') as f:
+        with open(a.out, 'w', encoding='utf-8', newline='\n') as f:
             f.write(out)
     print('%s: %d keyword states, %d guards, %d predicates (%d opaque), %d of %d actions can reject' % (
         a.grammar, len(states), len(guards), len(preds), sum(1 for p in preds.values() if '?' in p or '$' in p),

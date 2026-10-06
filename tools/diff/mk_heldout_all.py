@@ -30,13 +30,13 @@ def read_script(path):
 
 def build(version):
     dumps = '%s/oracle-%s' % (P, version)
-    idx = json.load(open(dumps + '/index.json'))
+    idx = json.load(open(dumps + '/index.json', encoding='utf-8'))
     if not idx['parser'].startswith(version + 'Parser('):
         raise SystemExit('%s/index.json was made by %s' % (dumps, idx['parser']))
     ok = sorted(e['path'] for e in idx['entries'] if e['ok'])
     err = sorted(e['path'] for e in idx['entries'] if not e['ok'])
-    open('%s/%s-ok-list.txt' % (P, version), 'w').write(''.join(p + '\n' for p in ok))
-    open('%s/%s-err-list.txt' % (P, version), 'w').write(''.join(p + '\n' for p in err))
+    open('%s/%s-ok-list.txt' % (P, version), 'w', encoding='utf-8', newline='\n').write(''.join(p + '\n' for p in ok))
+    open('%s/%s-err-list.txt' % (P, version), 'w', encoding='utf-8', newline='\n').write(''.join(p + '\n' for p in err))
     out = '%s/heldout-%s' % (P, version)
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -46,7 +46,7 @@ def build(version):
         if not e['ok']:
             continue
         u16 = read_script(e['source']).encode('utf-16-le')
-        tree = json.load(open(dumps + '/' + e['path'] + '.json'))['tree']
+        tree = json.load(open(dumps + '/' + e['path'] + '.json', encoding='utf-8'))['tree']
         for b in tree['Batches']:
             for s in b['Statements']:
                 first, last, off, length = s['$pos']
@@ -59,8 +59,8 @@ def build(version):
                     continue
                 seen[h] = (e['path'], s['$type'])
                 open('%s/%s.sql' % (out, h), 'w', encoding='utf-8', newline='').write(stmt)
-    open('%s/hoa-%s-list.txt' % (P, version), 'w').write(''.join('%s.sql\n' % h for h in sorted(seen)))
-    json.dump(seen, open('%s/hoa-%s-origin.json' % (P, version), 'w'), indent=0, sort_keys=True)
+    open('%s/hoa-%s-list.txt' % (P, version), 'w', encoding='utf-8', newline='\n').write(''.join('%s.sql\n' % h for h in sorted(seen)))
+    json.dump(seen, open('%s/hoa-%s-origin.json' % (P, version), 'w', encoding='utf-8'), indent=0, sort_keys=True)
     odir = '%s/hoa-%s-oracle' % (P, version)
     shutil.rmtree(odir, ignore_errors=True)
     subprocess.run([ORACLE, 'dump', '--parser', version, '--jobs', '8', odir, out], check=True,

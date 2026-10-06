@@ -54,7 +54,7 @@ class LexConverter:
             if os.path.isdir(override_dir):
                 for f in sorted(os.listdir(override_dir)):
                     if f.endswith('.g4'):
-                        self.overrides[f[:-3]] = open(os.path.join(override_dir, f)).read().rstrip('\n')
+                        self.overrides[f[:-3]] = open(os.path.join(override_dir, f), encoding='utf-8').read().rstrip('\n')
         self.renames = {}
         for r in self.L.rules:
             if r.protected and r.name in self.vocab and not self.is_empty(r):

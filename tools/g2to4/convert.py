@@ -136,7 +136,7 @@ def load_action_overrides(path):
     if not os.path.exists(path):
         return ov
     cur, buf = None, []
-    for line in open(path):
+    for line in open(path, encoding='utf-8'):
         m = re.match(r'^=== (\w+) (\w+|\*) sha=([0-9a-f]{8})\s*$', line)
         if m:
             cur, buf = (m.group(1), m.group(2), m.group(3)), []
@@ -156,7 +156,7 @@ def load_common_action_overrides(path):
     out = {}
     if os.path.exists(path):
         cur, buf = None, []
-        for line in open(path):
+        for line in open(path, encoding='utf-8'):
             m = re.match(r'^=== (\w+) \* sha=([0-9a-f]{8})\s*$', line)
             if m:
                 cur, buf = (m.group(1), m.group(2)), []
@@ -177,7 +177,7 @@ def load_rule_overrides(d):
     if os.path.isdir(d):
         for f in sorted(os.listdir(d)):
             if f.endswith('.g4'):
-                text = open(os.path.join(d, f)).read().rstrip('\n')
+                text = open(os.path.join(d, f), encoding='utf-8').read().rstrip('\n')
                 m = re.match(r'// g2to4: sha=([0-9a-f]{8})\n', text)
                 ov[f[:-3]] = (m.group(1) if m else None, text[m.end():] if m else text)
     return ov
@@ -583,7 +583,7 @@ class Converter:
         for path in (os.path.join(self.common_dir, 'synpreds.txt'), os.path.join(self.overrides_dir, 'synpreds.txt')):
             if not os.path.exists(path):
                 continue
-            for line in open(path):
+            for line in open(path, encoding='utf-8'):
                 line = line.split('#', 1)[0].strip()
                 if line:
                     rule, n = line.split()
@@ -689,9 +689,9 @@ class Converter:
 
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    old = open(path).read() if os.path.exists(path) else None
+    old = open(path, encoding='utf-8').read() if os.path.exists(path) else None
     if old != text:
-        with open(path, 'w') as f:
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
 
 
@@ -741,13 +741,13 @@ def run_antlr(java, jar, gdir, outdir, grammar, n_parts):
     with tempfile.TemporaryDirectory() as tmp:
         cmd = [java, '-Xss64m', '-jar', jar, '-Dlanguage=Cpp', '-package', 'tsql::parser', '-no-listener', '-no-visitor',
                '-long-messages', '-o', tmp, '-Xexact-output-dir', lexer_name + '.g4', parser_name + '.g4']
-        p = subprocess.run(cmd, cwd=gdir, capture_output=True, text=True)
+        p = subprocess.run(cmd, cwd=gdir, capture_output=True, encoding='utf-8', errors='replace')
         out = (p.stdout + p.stderr).strip()
         if p.returncode != 0:
             raise SystemExit('ANTLR tool failed:\n' + out)
         files = {}
         for f in [n + ext for n in (lexer_name, parser_name) for ext in ('.cpp', '.h')]:
-            src = open(os.path.join(tmp, f)).read()
+            src = open(os.path.join(tmp, f), encoding='utf-8').read()
             # ANTLR stamps the absolute grammar path; keep the output reproducible
             src = re.sub(r'^// Generated from .*$', '// Generated from %s by ANTLR 4.13.2 (tools/g2to4/convert.py)'
                          % f.replace('.cpp', '.g4').replace('.h', '.g4'), src, count=1, flags=re.M)
@@ -842,7 +842,7 @@ def cmd_antlr(a):
 
 
 def cmd_support(a):
-    inputs = [json.load(open(f)) for f in a.inputs]
+    inputs = [json.load(open(f, encoding='utf-8')) for f in a.inputs]
     model = Model(a.ssd, a.ast_enums)
     sup = support.generate(SupportInputs(a.ssd, model, inputs), a.out)
     if a.report:

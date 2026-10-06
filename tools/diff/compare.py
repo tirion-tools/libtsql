@@ -66,7 +66,7 @@ def main():
     ap.add_argument("--strict", action="store_true")
     args = ap.parse_args()
 
-    files = [l.strip() for l in open(args.list) if l.strip()]
+    files = [l.strip() for l in open(args.list, encoding="utf-8") if l.strip()]
     results = collections.OrderedDict()
     buckets = collections.Counter()
     for rel in files:
@@ -124,7 +124,7 @@ def main():
             print(f"- {rel}: {path}\n    oracle: {short(a)}\n    ours:   {short(b)}")
     if args.json:
         json.dump({rel: {"status": s, "diff": d} for rel, (s, d) in results.items()},
-                  open(args.json, "w"), indent=1, default=str)
+                  open(args.json, "w", encoding="utf-8"), indent=1, default=str)
     return 0 if counts["pass"] == total else 1
 
 

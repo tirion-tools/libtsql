@@ -58,7 +58,7 @@ def make_inputs():
             name = '%s.%s.sql' % (base, tag)
             open(out + '/' + name, 'w', encoding='utf-8', newline='').write(body)
             names.append(name)
-    open(stamp, 'w').close()
+    open(stamp, 'w', encoding='utf-8').close()
     return sorted(names)
 
 
@@ -92,7 +92,7 @@ def main():
     a = ap.parse_args()
     dump = a.build + '/src/parser/tsql_dump'
     cap = ([P + '/bin/capped'] if os.access(P + '/bin/capped', os.X_OK) else []) + ['prlimit', '--as=%d' % (2 << 30)]
-    versions = a.version or subprocess.run([dump, '--list-versions'], capture_output=True, text=True,
+    versions = a.version or subprocess.run([dump, '--list-versions'], capture_output=True, encoding='utf-8',
                                            check=True).stdout.split()
     os.makedirs(WORK, exist_ok=True)
     files = make_inputs()

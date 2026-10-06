@@ -1,4 +1,5 @@
-# Local fixes to the pinned ANTLR 4.13.2 C++ runtime, held to the same warning bar as libtsql.
+# Local fixes to the pinned ANTLR 4.13.2 C++ runtime: warnings (held to the same bar as libtsql)
+# and a missing include that breaks MSVC.
 # Run by FetchContent's PATCH_COMMAND in the extracted source root (cmake -P, no other tools):
 #   cmake [-DTSQL_PATCH_HASH=<sha256 of this file>] -P antlr4-runtime.cmake
 # (TSQL_PATCH_HASH is unused here: it only puts this file's content into the patch command, so an
@@ -6,7 +7,7 @@
 # Each fix replaces one exact piece of upstream text, marked [libtsql]; a fix already present is
 # skipped (re-configure, re-population), and text matching neither side stops the configure (the
 # pin changed: re-check the fix against the new release). Drop a fix once upstream carries it;
-# antlr/antlr4 dev still has both as of 2026-10-05 (7d57703).
+# antlr/antlr4 dev still has all of them as of 2026-10-06 (7d57703).
 cmake_minimum_required(VERSION 3.28)
 
 function(tsql_patch file old new)
@@ -39,3 +40,9 @@ tsql_patch(runtime/Cpp/runtime/src/Vocabulary.cpp
 tsql_patch(runtime/Cpp/runtime/src/tree/xpath/XPathLexer.cpp
     "void XPathLexer::IDAction(antlr4::RuleContext *context, size_t actionIndex) {\n"
     "void XPathLexer::IDAction(antlr4::RuleContext * /*context*/, size_t actionIndex) { // [libtsql] unused parameter\n")
+
+# MSVC: ProfilingATNSimulator.cpp uses std::chrono::high_resolution_clock without including
+# <chrono>; GCC's and Clang's standard headers happen to pull it in, MSVC's do not.
+tsql_patch(runtime/Cpp/runtime/src/atn/ProfilingATNSimulator.cpp
+    "#include \"support/CPPUtils.h\"\n\n#include \"atn/ProfilingATNSimulator.h\"\n"
+    "#include \"support/CPPUtils.h\"\n\n#include <chrono> // [libtsql] used below; MSVC's headers do not include it transitively\n\n#include \"atn/ProfilingATNSimulator.h\"\n")

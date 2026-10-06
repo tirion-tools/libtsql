@@ -13,9 +13,9 @@ HDR = '// Ported from Microsoft SqlScriptDOM (MIT) @ eaf3a6e: %s\n// GENERATED b
 
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    old = open(path).read() if os.path.exists(path) else None
+    old = open(path, encoding='utf-8').read() if os.path.exists(path) else None
     if old != text:
-        with open(path, 'w') as f:
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
 
 

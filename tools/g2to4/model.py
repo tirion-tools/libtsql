@@ -123,7 +123,7 @@ class Model:
     def _load_ast_enums(self, path):
         names = set()
         if os.path.exists(path):
-            txt = open(path).read()
+            txt = open(path, encoding='utf-8').read()
             for m in re.finditer(r'enum class (\w+)', txt):
                 names.add(m.group(1))
         return names
