@@ -23,6 +23,10 @@ namespace atn { class ATN; }
 namespace dfa { class Vocabulary; }
 }  // namespace antlr4
 
+namespace tsql::parser {
+class TSqlParserATNSimulator;
+}  // namespace tsql::parser
+
 namespace tsql::editor::detail {
 
 /// tools/g2to4/editor_meta.py output, one table per grammar.
@@ -43,6 +47,21 @@ struct KeywordGuardEntry {
 struct PredicateEntry {
     int index;          // predicate index (PredicateTransition::getPredIndex)
     const char* expr;   // see Walker.h EvaluatePredicate
+};
+/// The actions of a rule ({...} in the grammar, not predicates): how many there are and the
+/// ordinals (in the rule's text order, space-separated) of those that can reject the input in a
+/// way the walk does not model; rule nullptr ends the table.
+struct RuleActionsEntry {
+    const char* rule;
+    int count;
+    const char* rejecting;
+};
+/// An action (the `ordinal`-th of `rule`) that returns from its rule when `condition` (a predicate
+/// expression, see Walker.h EvaluatePredicate) holds and does nothing else; rule nullptr ends the table.
+struct ReturningActionEntry {
+    const char* rule;
+    int ordinal;
+    const char* condition;
 };
 
 /// A lexed token: ast::TSqlTokenType value and its UTF-8 byte range in the input.
@@ -160,6 +179,15 @@ public:
     /// The parse ended at token `index` (the rest of the tokens were never consumed), having
     /// examined the tokens before `lookEnd` only.
     virtual void OnEnd(size_t index, size_t lookEnd) = 0;
+    /// The parse reads past the tokens lexed so far: lex more (a Buffer lexes on demand; the
+    /// view's token vectors grow). False at the end of the text.
+    virtual bool MoreTokens() = 0;
+};
+
+/// A token the walk asks a predicate about: it stands at the caret (and nothing after it).
+struct ProbeToken {
+    uint32_t type = 0;
+    std::string_view text;
 };
 
 /// A finished Grammar::ParseToCaret; the parser stays alive so that the walk can evaluate the
@@ -168,12 +196,25 @@ class CaretSession {
 public:
     virtual ~CaretSession() = default;
     CaretParse result;
+    enum : int { kTrue = 1, kFalse = 0, kUnknown = -1, kReadsCaret = -2 };
     /// Runs predicate `predIndex` (of rule `ruleIndex`) with the parser at parser-token `index`. A
     /// predicate that reads only the tokens ('$' in editor_meta.py's expression) runs anywhere; one
     /// that reads rule locals ('?') only in the context of `locals` (the capture the walk stands
-    /// at: same rule, same token, no action run since), else it is unknown. 1: true, 0: false,
-    /// -1: unknown (also when it needs a token at or after the caret, or failed).
-    virtual int EvaluatePredicate(size_t ruleIndex, size_t predIndex, size_t index, const Capture* locals) = 0;
+    /// at: same rule, same token, no action run since), else it is unknown. With `probe`, the
+    /// parser sees that token at the caret. kTrue, kFalse, kUnknown (failed, or it read past the
+    /// caret or the probe), kReadsCaret (no probe: it needs the token at the caret).
+    virtual int EvaluatePredicate(size_t ruleIndex, size_t predIndex, size_t index, const Capture* locals,
+                                  const ProbeToken* probe = nullptr) = 0;
+    /// The parser's simulator (ANTLR 2's decision tests: TSqlParserATNSimulator::Antlr2TestsFor).
+    virtual parser::TSqlParserATNSimulator& Simulator() = 0;
+};
+
+/// Grammar::TryParse: whether a text parses as far as it goes.
+enum class Trial {
+    Parses,      // the parser stood at the end of the text without an error
+    Prefix,      // undecided: an error where the text ends, or after a choice the end decided
+    Fails,       // an error before the end
+    Undecided,   // an error after a predicate looked at the end (what follows may change it)
 };
 
 /// ATN states of the script and batch rules a resumed parse replays (derived from the ATN; the
@@ -210,6 +251,22 @@ public:
     std::unordered_map<std::string, size_t> tokenTypes;
     /// rule indexes of the statement-level rules (statement, lastStatement, ...)
     std::vector<size_t> statementRules;
+    /// by ATN state: its ACTION transition can reject the input (RuleActionsEntry)
+    std::vector<uint8_t> rejectingAction;
+    /// by ATN state, what can happen from it before the parser looks at the next token (a decision,
+    /// a returning action's test, a token match): an action that can reject the input runs
+    /// (kRejectAhead), its rule ends (kEndAhead: then what follows the rule call decides)
+    enum : uint8_t { kRejectAhead = 1, kEndAhead = 2 };
+    std::vector<uint8_t> actionAhead;
+    /// by ATN state of an ACTION transition: the condition under which it returns from its rule
+    /// (ReturningActionEntry)
+    std::unordered_map<size_t, std::string> returningAction;
+    /// by ATN state: a decision state the generated code predicts with adaptivePredict, where the
+    /// runtime applies ANTLR 2's tests (TSqlParserATNSimulator; the others it decides with LA(1))
+    std::vector<uint8_t> predictedDecision;
+    /// rules whose actions in the table and in the ATN differ in number (all their actions count as
+    /// rejecting): 0 unless editor_meta.py misread the grammar
+    size_t actionTableMismatches = 0;
     TopLevelStates top;
 
     size_t RuleIndex(std::string_view name) const;   // SIZE_MAX if unknown
@@ -235,16 +292,24 @@ public:
     virtual std::unique_ptr<CaretSession> ParseToCaret(const TokenSourceView& tokens, const ResumePoint& from,
                                                        size_t limit) const = 0;
 
+    /// Parses `tokens` (all of them, from the script's start) until the parser stands at their end
+    /// or an error. Unlike ParseToCaret, a prediction that reads to the end does not stop the
+    /// parse: it decides as for a text that ends there, and the parse goes on; an error after a
+    /// choice the end decided leaves the trial undecided (TrialSimulator).
+    virtual Trial TryParse(const TokenSourceView& tokens) const = 0;
+
     /// Convenience: every token of `sql` (Buffer::SetText's lex).
     void Lex(std::string_view sql, std::vector<LexToken>& out) const;
 
 protected:
     /// Takes the ATN, names and metadata (`parser` is any parser of the grammar).
     void Init(SqlVersion v, int flag, antlr4::Parser& parser, const KeywordStateEntry* states, size_t nStates,
-              const KeywordGuardEntry* guards, const PredicateEntry* preds, size_t nPreds);
+              const KeywordGuardEntry* guards, const PredicateEntry* preds, size_t nPreds,
+              const RuleActionsEntry* actions, const ReturningActionEntry* returning, const int* predicted);
 
 private:
     void InitTopLevel();
+    void InitActionAhead();
 };
 
 /// The grammar for `version`; throws std::invalid_argument when this build lacks it.

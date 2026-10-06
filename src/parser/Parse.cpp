@@ -171,8 +171,13 @@ void BuildScriptTokens(antlr4::CommonTokenStream& stream, const Decoded& d, bool
         pt.Offset = d.utf16[start];
         pt.Line = d.line[start];
         pt.Column = d.column[start];
-        if (t->getType() != antlr4::Token::EOF) pt.Text = t->getText();
         auto* ct = static_cast<antlr4::CommonToken*>(t);
+        if (t->getType() != antlr4::Token::EOF) {
+            pt.Text = t->getText();
+            // decoded once: getText() of a token without text decodes it from the input again
+            // (also for the parser's copy, VisibleTokens), and the parser compares token texts
+            ct->setText(pt.Text);
+        }
         if (pt.TokenType == ast::TSqlTokenType::AsciiStringOrQuotedIdentifier) {
             // TSqlWhitespaceTokenFilter: ConvertStringToIdentifier = QUOTED_IDENTIFIER setting
             pt.ConvertStringToIdentifier = initialQuotedIdentifiers;
@@ -195,7 +200,8 @@ std::vector<std::unique_ptr<antlr4::Token>> VisibleTokens(const std::vector<antl
     // full-stream indexes, and the parser looks up hidden tokens in the full list.
     std::vector<std::unique_ptr<antlr4::Token>> visible;
     for (antlr4::Token* t : all)
-        if (t->getChannel() == antlr4::Token::DEFAULT_CHANNEL) visible.push_back(std::make_unique<FullStreamIndexToken>(t));
+        if (t->getChannel() == antlr4::Token::DEFAULT_CHANNEL)
+            visible.push_back(std::make_unique<FullStreamIndexToken>(*static_cast<const antlr4::CommonToken*>(t)));
     return visible;
 }
 

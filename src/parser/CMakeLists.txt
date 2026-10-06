@@ -36,19 +36,16 @@ set(gen ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(g2to4 ${TSQL_PARSER_ROOT}/tools/g2to4)
 set(g2to4_py ${g2to4}/convert.py ${g2to4}/antlr2.py ${g2to4}/cs2cpp.py ${g2to4}/lexer.py ${g2to4}/model.py)
 set(ssd_tsql ${TSQL_SSD_DIR}/SqlScriptDom/Parser/TSql)
-# Override files are found at configure time; the directories are dependencies too (their mtime
-# changes when files are added or removed), so new overrides are picked up without re-running CMake
-# and a second build is a no-op.
-file(GLOB_RECURSE common_overrides LIST_DIRECTORIES true ${g2to4}/overrides/common/*)
-list(APPEND common_overrides ${g2to4}/overrides ${g2to4}/overrides/common)
+# Override files are globbed with CONFIGURE_DEPENDS: adding or removing one re-runs CMake at the
+# next build, and editing one re-runs the steps that read it.
+file(GLOB_RECURSE common_overrides CONFIGURE_DEPENDS ${g2to4}/overrides/common/*)
 # 1. grammar: <G>.g -> ANTLR 4 grammars, for every grammar (the shared support code is the union
 #    over all of them, whichever are built)
 set(support_inputs)
 foreach(g IN LISTS TSQL_PARSER_ALL_GRAMMARS)
     set(g_overrides)
     if(IS_DIRECTORY ${g2to4}/overrides/${g})
-        file(GLOB_RECURSE g_overrides LIST_DIRECTORIES true ${g2to4}/overrides/${g}/*)
-        list(APPEND g_overrides ${g2to4}/overrides/${g})
+        file(GLOB_RECURSE g_overrides CONFIGURE_DEPENDS ${g2to4}/overrides/${g}/*)
     endif()
     set(gdir ${gen}/${g}/grammar)
     add_custom_command(
@@ -64,9 +61,8 @@ foreach(g IN LISTS TSQL_PARSER_ALL_GRAMMARS)
 endforeach()
 # 2. support: code shared by every grammar (also reads the hand-written sources for the
 #    OptionsHelper classes they use)
-file(GLOB parser_hand_sources ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/*.h
+file(GLOB parser_hand_sources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/*.h
     ${CMAKE_CURRENT_SOURCE_DIR}/helpers/*)
-list(APPEND parser_hand_sources ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/helpers)
 set(support_headers)
 foreach(f CodeGenerationSupporter.h TSqlParserResource.h Keywords.h OptionHelpers.h ParserEnums.h)
     list(APPEND support_headers ${gen}/support/${f})

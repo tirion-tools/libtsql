@@ -18,8 +18,9 @@
 //   --sweep                Complete() at every byte offset: slowest call, failures
 //   --overoffer STRIDE FILE... [--verbose | --all]
 //                          at every STRIDE-th token start after whitespace whose batch prefix parses,
-//                          the offered keywords that make `prefix KEYWORD` fail to parse (--verbose:
-//                          list each; --all: list every offered keyword, marked valid or invalid)
+//                          the offered keywords that make `prefix KEYWORD` fail to parse: a trial parse
+//                          (the engine's, Grammar::TryParse) errs before the end (--verbose: list each;
+//                          --all: list every offered keyword, marked valid, invalid or undecided)
 //   --segments FILE...     statement starts of the token scanner (StatementStartFromTokens) against
 //                          the parser's (Document resume points) in batches that parse
 // Completion runs against a synthetic catalog of 5 databases x 400 objects x 12 columns plus a
@@ -175,11 +176,13 @@ int Walk(SqlVersion version, const std::string& sql, size_t caret) {
     in.startPending = cap.errorInStatement ? -1 : cap.pendingCall;
     in.caret = ps.tokens.size();
     const editor::detail::Capture* locals = cap.errorInStatement ? nullptr : &cap;
-    in.evaluate = [&](size_t rule, size_t pred, size_t at, bool live) {
-        const int v = session->EvaluatePredicate(rule, pred, at, live ? locals : nullptr);
-        std::printf("  predicate %zu (%s) at %zu%s: %d\n", pred, (*g.ruleNames)[rule].c_str(), at, live ? " live" : "", v);
+    in.evaluate = [&](size_t rule, size_t pred, size_t at, bool live, const editor::detail::ProbeToken* probe) {
+        const int v = session->EvaluatePredicate(rule, pred, at, live ? locals : nullptr, probe);
+        std::printf("  predicate %zu (%s) at %zu%s%s%s: %d\n", pred, (*g.ruleNames)[rule].c_str(), at, live ? " live" : "",
+                    probe != nullptr ? " probe " : "", probe != nullptr ? std::string(probe->text).c_str() : "", v);
         return v;
     };
+    in.simulator = &session->Simulator();
     std::map<std::string, std::set<std::string>> seen;
     auto stats = editor::detail::Walk(g, in, [&](const editor::detail::WalkCandidate& c) {
         std::string tok(g.vocabulary->getSymbolicName(c.tokenType));
@@ -190,6 +193,8 @@ int Walk(SqlVersion version, const std::string& sql, size_t caret) {
         }
         if (c.hints) tok += "+hints" + std::to_string(c.hints->size());
         if (c.nextStatement) tok += " (next statement)";
+        if (c.doubtToken) tok += " (doubt: token)";
+        if (c.doubtPath != 0) tok += " (doubt: path " + std::to_string(c.doubtPath % 997) + ")";
         std::string path;
         for (size_t k = 0; k < c.rules->size() && k < 8; ++k) path += (*g.ruleNames)[(*c.rules)[k]] + "<";
         seen[tok].insert(path);
@@ -342,12 +347,20 @@ bool PrefixHasError(const editor::detail::Grammar& g, editor::detail::Buffer& b,
     return session->result.syntaxErrors || !session->result.capture.captured;
 }
 
+/// The trial parse of `text` (Grammar::TryParse: the parse goes on past a look-ahead that reads to
+/// the end): Fails is an error before the end.
+editor::detail::Trial TrialOf(const editor::detail::Grammar& g, editor::detail::Buffer& b, std::string_view text) {
+    b.SetText(text);
+    b.Tokens();
+    return g.TryParse(b.View());
+}
+
 int OverOffer(SqlVersion version, const std::vector<std::string>& files, size_t stride, bool verbose, bool listAll) {
     using editor::CompletionKind;
     const auto& g = editor::detail::GrammarFor(version);
     editor::detail::Buffer scratch(g);
     const editor::Catalog catalog = SyntheticCatalog();
-    size_t carets = 0, offered = 0, invalid = 0, seen = 0;
+    size_t carets = 0, offered = 0, invalid = 0, undecided = 0, seen = 0;
     std::map<std::string, size_t> offenders;
     for (const std::string& path : files) {
         const std::string sql = ReadFile(path);
@@ -371,18 +384,24 @@ int OverOffer(SqlVersion version, const std::vector<std::string>& files, size_t 
                     item.kind != CompletionKind::QueryHint)
                     continue;
                 ++offered;
-                const bool bad = PrefixHasError(g, scratch, prefix + item.insertText + " ");
+                const editor::detail::Trial trial = TrialOf(g, scratch, prefix + item.insertText + " ");
+                const bool bad = trial == editor::detail::Trial::Fails;
                 if (bad) ++invalid, ++offenders[item.insertText];
+                if (trial == editor::detail::Trial::Undecided) ++undecided;
                 if (verbose && (bad || listAll)) {
                     const size_t from = prefix.size() > 80 ? prefix.size() - 80 : 0;
+                    const char* verdict = bad ? "  [invalid]"
+                                          : trial == editor::detail::Trial::Undecided ? "  [undecided]"
+                                                                                      : "  [valid]";
                     std::printf("  %s @%zu: ...%s| %s%s\n", path.c_str(), caret, prefix.substr(from).c_str(),
-                                item.insertText.c_str(), listAll ? (bad ? "  [invalid]" : "  [valid]") : "");
+                                item.insertText.c_str(), listAll ? verdict : "");
                 }
             }
         }
     }
     std::printf("over-offer: %zu files, %zu carets, %zu keywords offered, %zu invalid (%.2f%%)\n", files.size(), carets,
                 offered, invalid, offered ? 100.0 * static_cast<double>(invalid) / static_cast<double>(offered) : 0.0);
+    std::printf("  (%zu undecided: an error after a predicate looked at the end of the text)\n", undecided);
     std::vector<std::pair<size_t, std::string>> top;
     for (auto& [w, n] : offenders) top.emplace_back(n, w);
     std::sort(top.rbegin(), top.rend());

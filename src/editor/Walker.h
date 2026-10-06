@@ -1,6 +1,8 @@
 // Editor support, internal: the tokens that can stand at the caret, found by walking the
 // grammar's ATN from the configuration the parser was in (Capture) over the tokens up to the
-// caret, through every alternative (no prediction), like antlr4-c3's CodeCompletionCore.
+// caret, through every alternative (no prediction), like antlr4-c3's CodeCompletionCore, except
+// where ANTLR 2's tests (the runtime's emulation of SqlScriptDOM's decisions) take an earlier
+// alternative on those tokens.
 //
 // SqlScriptDOM accepts most keywords as Identifier tokens whose text an action or predicate
 // checks; the walk applies the grammar's keyword metadata (tools/g2to4/editor_meta.py), so an
@@ -27,8 +29,11 @@ struct WalkInput {
     size_t budget = 400'000;        // configurations visited at most
     /// Runs an opaque predicate of the grammar with the real parser on the tokens before the caret
     /// (CaretSession::EvaluatePredicate: rule, predicate, token index, whether the walk still stands
-    /// where the parser stood (its rule locals apply) -> 1, 0, -1).
-    std::function<int(size_t, size_t, size_t, bool)> evaluate;
+    /// where the parser stood (its rule locals apply), the token at the caret or null -> kTrue, ...).
+    std::function<int(size_t, size_t, size_t, bool, const ProbeToken*)> evaluate;
+    /// The parser's simulator: ANTLR 2's tests at the decisions the parser predicts (null: the
+    /// walk follows every alternative).
+    parser::TSqlParserATNSimulator* simulator = nullptr;
 };
 
 /// One way a token can stand at the caret.
@@ -44,6 +49,17 @@ struct WalkCandidate {
     /// The statement the walk started in ended before the token (it follows that statement in its
     /// batch, block, IF, WHILE or module body).
     bool nextStatement = false;
+    /// The path took a token after that statement ended (ELSE, an enclosing block's END, ...): a
+    /// trial of that statement's text alone cannot settle a doubt about the token.
+    bool beyondStatement = false;
+    /// The parser may not take this token here for a reason the walk cannot decide; a trial parse of
+    /// the text with the token settles it. `doubtPath`: the path to it ran an action that can reject
+    /// the input (or a predicate on rule locals the walk does not have), the last such (whose
+    /// outcome is the same for every token behind it) as a key, 0: none. `doubtToken`: such an
+    /// action runs right after the token, before the parser looks further (its outcome may depend
+    /// on the token).
+    uint64_t doubtPath = 0;
+    bool doubtToken = false;
 };
 
 struct WalkStats {

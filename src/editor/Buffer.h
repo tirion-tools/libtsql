@@ -4,6 +4,10 @@
 // Lexing: every token remembers how far the lexer looked to produce it and the lexer's state after
 // it; an edit is lexed again from the last token whose look did not reach the edit until a token
 // ends where an old token ended (shifted) in the same state: from there the tokens are the old ones.
+// The text is lexed on demand, from its start as far as a query, a parse or ParseAhead needs (the
+// lexer resumes at a token's end in the state after it, as after an edit), so SetText costs nothing
+// in proportion to the text. Unless everything is lexed, the last token lexed is parser-visible and
+// not GO, so the start of each batch region lexed so far is known.
 //
 // Parsing: the script's parse is recorded lazily, as far as a query needs it, as the role of each
 // token and the resume points it passes (statement and batch boundaries, Grammar::ResumePoint),
@@ -20,6 +24,7 @@
 // the edit's GO are kept as they are.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -39,13 +44,23 @@ public:
     void Edit(size_t start, size_t length, std::string_view replacement);
     const std::string& Text() const { return text_; }
 
-    /// Every token incl. whitespace and comments (bytes no token covers failed to lex).
-    const std::vector<LexToken>& Tokens() const { return tokens_; }
+    /// Every token incl. whitespace and comments (bytes no token covers failed to lex): lexes the
+    /// rest of the text first.
+    const std::vector<LexToken>& Tokens();
+    /// The tokens lexed so far: a prefix of Tokens(). Lexing (LexTo, Tokens, parses) only appends.
+    const std::vector<LexToken>& Lexed() const { return tokens_; }
+    /// Lexes up to the first parser-visible token (not GO) that starts at or after byte `offset`,
+    /// or to the end.
+    void LexTo(size_t offset);
+    /// Lexes through the batch region that holds byte `offset`: up to the first GO at or after it
+    /// (and the token after that, as LexTo), or to the end.
+    void LexBatchOf(size_t offset);
     TokenSourceView View() const;
-    /// The parser-visible tokens and the index in Tokens() of each.
-    const std::vector<LexToken>& Visible();
-    const std::vector<uint32_t>& VisibleToToken();
-    /// Index of the first token starting at or after byte `offset`.
+    /// The parser-visible tokens lexed so far and the index in Lexed() of each (kept as lexing
+    /// appends and edits splice: a parse that lexes more may reallocate them).
+    const std::vector<LexToken>& Visible() const { return visible_; }
+    const std::vector<uint32_t>& VisibleToToken() const { return visibleToToken_; }
+    /// Index of the first token lexed so far starting at or after byte `offset`.
     size_t TokenAt(size_t offset) const;
 
     /// Parses the batch regions that hold tokens [first, end) until the roles of those tokens are
@@ -58,12 +73,25 @@ public:
     ResumePoint ResumeAtOrBefore(size_t index, size_t lookLimit = SIZE_MAX) const;
     /// Where the parse of the batch holding token `index` starts (the script start or BatchStart).
     ResumePoint BatchResumeAtOrBefore(size_t index) const;
+    /// Parses every batch region in order, from where its parse stands, until all are parsed (true)
+    /// or the first resume point reached at or after `deadline` (false): Document::ParseAhead. The
+    /// parse is the one queries make (they resume from the same points).
+    bool ParseAhead(std::chrono::steady_clock::time_point deadline);
+    /// How many parses (Grammar::ParseFrom) the buffer has run: lets tests see that a query parsed nothing.
+    size_t ParseCount() const { return parseCount_; }
 
 private:
     void OnRole(size_t index, const TokenRole& role) override;
     void OnPredicateKeyword(size_t index) override;
     bool OnCheckpoint(const ResumePoint& at, size_t lookEnd) override;
     void OnEnd(size_t index, size_t lookEnd) override;
+    bool MoreTokens() override;
+
+    /// Replaces bytes of the text (Edit's clamped range), keeping invalidUtf8_ up to date.
+    void ReplaceText(size_t start, size_t length, std::string_view replacement);
+    /// Lexes on from the last token lexed: LexTo(until).
+    void LexMore(size_t until);
+    void Append(const LexedToken& t);
 
     struct Point {
         ResumePoint at;
@@ -101,8 +129,10 @@ private:
     std::vector<uint32_t> lookEnd_;      // per token: LexedToken::lookEnd, made cumulative (non-decreasing)
     std::vector<uint8_t> goAfter_;       // per token: LexedToken::goAfter
     std::vector<uint32_t> gos_;          // indexes of the GO tokens
+    uint32_t lexEnd_ = 0;                // where lexing stopped (the end of the last token lexed)
+    bool lexGo_ = true;                  // the lexer's state there
+    bool lexedAll_ = false;              // lexing reached the end of the text
 
-    bool visibleValid_ = false;
     std::vector<LexToken> visible_;
     std::vector<uint32_t> visibleToToken_;
 
@@ -110,6 +140,9 @@ private:
     std::vector<Run> runs_;              // by start: the regions parsed so far
     Run* current_ = nullptr;             // the run a parse extends
     size_t target_ = 0;                  // Extend's goal while a parse runs
+    std::chrono::steady_clock::time_point deadline_ = std::chrono::steady_clock::time_point::max();   // ParseAhead's
+    bool timeUp_ = false;                // a parse stopped at deadline_
+    size_t parseCount_ = 0;
     std::vector<uint32_t> pendingKeyword_;
 };
 

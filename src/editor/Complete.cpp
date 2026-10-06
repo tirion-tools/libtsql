@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unordered_map>
 
@@ -174,14 +175,30 @@ struct Contexts {
     std::vector<std::pair<std::string, CompletionKind>> keywords;
     std::set<std::string> keywordSeen;
     std::map<std::string, uint8_t> keywordPaths;   // KeywordPath bits of each keyword
+    /// How sure the walk is of each keyword (WalkCandidate::doubtPath, doubtToken over its candidates).
+    struct Doubt {
+        bool certain = false;            // a candidate without doubt
+        bool token = false;              // a candidate whose doubt depends on the keyword itself
+        std::vector<uint64_t> paths;     // the path doubts of the others
+    };
+    std::map<std::string, Doubt> keywordDoubt;
+    bool name = false;   // a free name (an Identifier of any text) can stand at the caret (perhaps in doubt)
+    /// A keyword in doubt was reached past the end of the statement the walk started in
+    /// (WalkCandidate::beyondStatement): its trials need the text from the enclosing statement on.
+    bool doubtBeyond = false;
 
     bool Any() const {
         return expression || builtinFunctions || tableSource || dmlTarget || objectTarget || procedure || dataType ||
                targetColumns || tableVariables || scalarVariables || setCommandValue || execParameters ||
                sourceColumns || selectIntoOn || dropTypes != 0 || !keywords.empty();
     }
-    void AddKeyword(const std::string& word, CompletionKind kind, uint8_t paths = kInStatement) {
+    void AddKeyword(const std::string& word, CompletionKind kind, uint8_t paths = kInStatement, uint64_t doubtPath = 0,
+                    bool doubtToken = false) {
         keywordPaths[word] |= paths;
+        Doubt& d = keywordDoubt[word];
+        if (doubtToken) d.token = true;
+        else if (doubtPath == 0) d.certain = true;
+        else if (std::find(d.paths.begin(), d.paths.end(), doubtPath) == d.paths.end()) d.paths.push_back(doubtPath);
         if (keywordSeen.insert(word + '\x01' + std::to_string(static_cast<int>(kind))).second)
             keywords.emplace_back(word, kind);
     }
@@ -216,9 +233,20 @@ struct Contexts {
         sourceColumns |= o.sourceColumns;
         selectIntoOn |= o.selectIntoOn;
         dropTypes |= o.dropTypes;
+        name |= o.name;
+        doubtBeyond |= o.doubtBeyond;
         typeNames.insert(o.typeNames.begin(), o.typeNames.end());
-        for (const auto& [word, kind] : o.keywords) AddKeyword(word, kind, 0);
+        for (const auto& [word, kind] : o.keywords)
+            if (keywordSeen.insert(word + '\x01' + std::to_string(static_cast<int>(kind))).second)
+                keywords.emplace_back(word, kind);
         for (const auto& [word, paths] : o.keywordPaths) keywordPaths[word] |= paths;
+        for (const auto& [word, d] : o.keywordDoubt) {
+            Doubt& mine = keywordDoubt[word];
+            mine.certain = mine.certain || d.certain;
+            mine.token = mine.token || d.token;
+            for (uint64_t p : d.paths)
+                if (std::find(mine.paths.begin(), mine.paths.end(), p) == mine.paths.end()) mine.paths.push_back(p);
+        }
     }
 };
 
@@ -238,6 +266,7 @@ public:
             return false;
         };
         Contexts& ctx = InFunctionArguments(rules) ? functionArgs_ : main_;
+        candidate_ = &c;
         const uint8_t paths = static_cast<uint8_t>((c.nextStatement ? kAfterStatement : kInStatement) |
                                                    (within(rules.size(), kDataType | kComputedColumn) ? kColumnStart : 0) |
                                                    (within(rules.size(), kPeriodDefinition) ? kPeriod : 0));
@@ -247,6 +276,7 @@ public:
                 for (const std::string& w : *c.words) Keyword(ctx, w, within, paths);
                 return;
             }
+            if (type == Ty(T::Identifier)) ctx.name = true;
             size_t k = 0;
             while (tag(k) & kWrapper) ++k;
             const uint64_t first = tag(k);
@@ -330,10 +360,12 @@ private:
         if (within(4, kTableHint)) kind = CompletionKind::TableHint;
         else if (within(3, kQueryHint)) kind = CompletionKind::QueryHint;
         else if (within(3, kExpressionPrimary) && FindBuiltin(word) != nullptr) kind = CompletionKind::BuiltinFunction;
-        ctx.AddKeyword(word, kind, paths);
+        ctx.AddKeyword(word, kind, paths, candidate_->doubtPath, candidate_->doubtToken);
+        if (candidate_->beyondStatement && (candidate_->doubtPath != 0 || candidate_->doubtToken)) ctx.doubtBeyond = true;
     }
 
     const std::vector<uint64_t>& tags_;
+    const WalkCandidate* candidate_ = nullptr;   // the candidate being added
     Contexts& main_;
     Contexts& functionArgs_;
 };
@@ -816,9 +848,10 @@ WalkResult WalkCaret(const Grammar& g, CaretSession& session, Contexts& ctx, Con
         in.startPending = pending;
         in.caret = ps.tokens.size();
         in.budget = budget;
-        in.evaluate = [&session, locals](size_t rule, size_t pred, size_t at, bool live) {
-            return session.EvaluatePredicate(rule, pred, at, live ? locals : nullptr);
+        in.evaluate = [&session, locals](size_t rule, size_t pred, size_t at, bool live, const ProbeToken* probe) {
+            return session.EvaluatePredicate(rule, pred, at, live ? locals : nullptr, probe);
         };
+        in.simulator = &session.Simulator();
         const bool any = Walk(g, in, [&](const WalkCandidate& c) { classifier.Add(c); }).emitted > 0;
         r.emitted = r.emitted || any;
         return any;
@@ -903,41 +936,139 @@ bool ColumnWithoutType(const ScriptTokens& t, size_t caretTok) {
     return false;
 }
 
-/// Whether `text` parses up to its end (a trial parse; the parser stops when it reaches the end).
-bool TextParses(const Grammar& g, const std::string& text) {
+/// A trial parse of `text` (Grammar::TryParse).
+Trial TryParse(const Grammar& g, const std::string& text) {
     Buffer scratch(g);
     scratch.SetText(text);
-    const auto session = g.ParseToCaret(scratch.View(), ResumePoint{}, scratch.Tokens().size());
-    return session->result.capture.captured && !session->result.syntaxErrors;
+    scratch.Tokens();
+    return g.TryParse(scratch.View());
 }
+
+/// Whether a trial parse reached the end of its text.
+bool Parsed(Trial t) { return t == Trial::Parses || t == Trial::Prefix; }
 
 /// Whether the statement before byte `end` can end there: the text from `start` (where the caret's
 /// statement starts) to `end`, followed by a statement, parses. (The grammar lets many statements
 /// end where an action then requires more, e.g. ALTER MESSAGE TYPE ... VALIDATION = VALID_XML
 /// needs WITH SCHEMA COLLECTION.)
 bool StatementCanEnd(const Grammar& g, std::string_view sql, size_t start, size_t end) {
-    return TextParses(g, std::string(sql.substr(start, end - start)) + "\nDECLARE ");
+    return Parsed(TryParse(g, std::string(sql.substr(start, end - start)) + "\nDECLARE "));
 }
 
-/// Keywords at the caret after a comma that repeat a word of the caret's statement: those that the
-/// statement's text from `start` to `end` cannot be followed by (an option given twice: actions
-/// call CheckOptionDuplication or throw SQL46049 on the option word). At most `limit` trials.
-std::vector<std::string> RepeatedKeywordsRejected(const Grammar& g, std::string_view sql, const ScriptTokens& t,
-                                                  size_t first, size_t caretTok, size_t start, size_t end,
-                                                  const std::vector<std::pair<std::string, CompletionKind>>& keywords) {
+/// Trial parses of a text followed by different words: the text is lexed once, each word's text
+/// from the token it touches on (Buffer::Edit).
+class Trials {
+public:
+    Trials(const Grammar& g, std::string_view text) : g_(g), buffer_(g), base_(text.size()) {
+        buffer_.SetText(text);
+        buffer_.Tokens();
+    }
+    /// The text followed by `tail`.
+    Trial With(std::string_view tail) {
+        buffer_.Edit(base_, buffer_.Text().size() - base_, tail);
+        buffer_.Tokens();
+        return g_.TryParse(buffer_.View());
+    }
+
+private:
+    const Grammar& g_;
+    Buffer buffer_;
+    size_t base_;
+};
+
+/// The keywords at the caret that the walk is unsure of (Contexts::Doubt) and that trial parses
+/// reject: the caret's statement text from `start` to `end` (`tokens` parser tokens), which parses
+/// on its own, followed by the keyword does not parse.
+///  - A path doubt (an action that can reject the input on the way to the keyword) is the same for
+///    every keyword behind it: a trial with one of them that the parser takes settles it (one only
+///    that doubt reaches where there is one; a few tries). A keyword is rejected when all its path
+///    doubts failed, unless it may also stand there as a name (then it takes a trial of its own).
+///  - A doubt about the keyword itself (an action right after it) takes a trial of each such
+///    keyword, when there are at most kKeywordTrials of them (when there are more, the action does
+///    not tell words apart: it counts options or checks the statement).
+/// The trials parse at most kTrialBudget tokens in all; what they leave undecided stays.
+std::vector<std::string> DoubtfulKeywordsRejected(const Grammar& g, std::string_view sql, size_t start, size_t end,
+                                                  size_t tokens, const Contexts& ctx) {
+    constexpr size_t kTrialBudget = 1024, kKeywordTrials = 16, kTriesPerPath = 3;
     std::vector<std::string> rejected;
-    if (caretTok == 0 || t.Type(caretTok - 1) != Ty(T::Comma)) return rejected;
-    std::set<std::string> words;
-    for (size_t i = first; i < caretTok; ++i)
-        if (t.IsName(i)) words.insert(Upper(t.Name(i)));
-        else if (KeywordText(t.Type(i)) != nullptr) words.insert(Upper(t.Text(i)));
-    constexpr size_t limit = 16;
-    size_t trials = 0;
-    const std::string text(sql.substr(start, end - start));
-    for (const auto& [word, kind] : keywords) {
-        if (words.count(word) == 0) continue;
-        if (trials++ == limit) break;
-        if (!TextParses(g, text + word + " ")) rejected.push_back(word);
+    const std::string_view text = sql.substr(start, end - start);
+    size_t spent = 0;
+    std::optional<Trials> trials;   // made by the first trial
+    bool textParses = false;
+    std::map<std::string, Trial> result;   // keyword -> its trial
+    // nullopt: not run (over budget; the text alone does not parse: a statement cut out of a block, say)
+    auto trial = [&](const std::string& word) -> std::optional<Trial> {
+        auto it = result.find(word);
+        if (it != result.end()) return it->second;
+        if (!trials) {
+            trials.emplace(g, text);
+            spent += tokens;
+            textParses = Parsed(trials->With(""));
+        }
+        if (!textParses || (spent += tokens + 1) > kTrialBudget) return std::nullopt;
+        const Trial t = trials->With(word + " ");
+        result.emplace(word, t);
+        return t;
+    };
+    auto doubt = [&](const std::string& word) -> const Contexts::Doubt& { return ctx.keywordDoubt.at(word); };
+    std::map<uint64_t, bool> pathOk;    // settled path doubts
+    std::map<uint64_t, size_t> tries;   // trials made to settle each
+    auto anyPathOk = [&](const Contexts::Doubt& d) {
+        return std::any_of(d.paths.begin(), d.paths.end(), [&](uint64_t p) {
+            auto it = pathOk.find(p);
+            return it != pathOk.end() && it->second;
+        });
+    };
+    bool over = false;
+    for (int round = 0; round < 2 && !over; ++round) {
+        // first the keywords with a single path doubt, then those with several
+        for (const auto& [word, kind] : ctx.keywords) {
+            const Contexts::Doubt& d = doubt(word);
+            if (d.certain || d.token || d.paths.empty() || (round == 0) != (d.paths.size() == 1)) continue;
+            std::vector<uint64_t> open;
+            for (uint64_t p : d.paths)
+                if (pathOk.count(p) == 0 && tries[p] < kTriesPerPath) open.push_back(p);
+            if (open.empty() || result.count(word) != 0) continue;
+            std::optional<Trial> r = trial(word);
+            if (!r) {
+                over = true;
+                break;
+            }
+            for (uint64_t p : open) ++tries[p];
+            // failed: all its paths fail; taken: at least one passes (taken to be every open one)
+            if (*r == Trial::Fails)
+                for (uint64_t p : d.paths) pathOk.emplace(p, false);
+            else if (*r == Trial::Parses)
+                for (uint64_t p : open) pathOk.emplace(p, true);
+        }
+    }
+    auto pathRejected = [&](const Contexts::Doubt& d) {
+        return !d.token && !d.paths.empty() && std::all_of(d.paths.begin(), d.paths.end(), [&](uint64_t p) {
+            auto it = pathOk.find(p);
+            return it != pathOk.end() && !it->second;
+        });
+    };
+    // a word the parser may take as a name there (its own trial decides)
+    auto nameWord = [&](const std::string& word) { return ctx.name && !IsReservedKeyword(word); };
+    // keywords whose own trial decides: doubts about themselves, and names a failed path rejects
+    std::vector<std::string> own;
+    for (const auto& [word, kind] : ctx.keywords) {
+        const Contexts::Doubt& d = doubt(word);
+        if (d.certain || result.count(word) != 0 || anyPathOk(d) ||
+            std::find(own.begin(), own.end(), word) != own.end())
+            continue;
+        if (d.token || (pathRejected(d) && nameWord(word))) own.push_back(word);
+    }
+    if (!over && own.size() <= kKeywordTrials)
+        for (const std::string& word : own)
+            if (!trial(word)) break;
+    for (const auto& [word, kind] : ctx.keywords) {
+        const Contexts::Doubt& d = doubt(word);
+        if (d.certain || std::find(rejected.begin(), rejected.end(), word) != rejected.end()) continue;
+        auto it = result.find(word);
+        const bool reject = it != result.end() ? it->second == Trial::Fails
+                                               : !anyPathOk(d) && pathRejected(d) && !nameWord(word);
+        if (reject) rejected.push_back(word);
     }
     return rejected;
 }
@@ -1037,16 +1168,17 @@ CompletionResult CompleteAt(Buffer& buffer, size_t caret, const Catalog& catalog
     caret = std::min(caret, sql.size());
     result.replaceStart = caret;
 
-    const std::vector<LexToken>& all = buffer.Tokens();
+    // the tokens through the caret's batch (the text after its GO is lexed only if a parse reads it)
+    buffer.LexBatchOf(caret);
+    const std::vector<LexToken>& all = buffer.Lexed();
     const CaretWord word = FindCaretWord(sql, caret, all);
     if (word.none) return result;
     result.replaceStart = word.start;
     result.replaceLength = word.end - word.start;
 
-    // the parser-visible tokens up to the end of the caret's batch (for the scope analysis)
-    const std::vector<LexToken>& visible = buffer.Visible();
-    const LexToken* vis = visible.data();
-    size_t visCount = visible.size();
+    // the parser-visible tokens up to the end of the caret's batch (for the scope analysis); the
+    // buffer's grow when the parse below lexes more, so they are read by index until it is done
+    const std::vector<LexToken>* visible = &buffer.Visible();
     std::vector<LexToken> relexed;
     if (word.quoted) {
         // an unterminated [name at the caret swallowed the text after it: lex that text again
@@ -1062,15 +1194,18 @@ CompletionResult CompleteAt(Buffer& buffer, size_t caret, const Catalog& catalog
                 t.end += static_cast<uint32_t>(caret);
                 relexed.push_back(t);
             }
-            vis = relexed.data();
-            visCount = relexed.size();
+            visible = &relexed;
         }
     }
     const size_t caretTok = static_cast<size_t>(
-        std::lower_bound(vis, vis + visCount, word.start, [](const LexToken& t, size_t o) { return t.start < o; }) - vis);
+        std::lower_bound(visible->begin(), visible->end(), word.start,
+                         [](const LexToken& t, size_t o) { return t.start < o; }) -
+        visible->begin());
     size_t batchEnd = caretTok;
-    while (batchEnd < visCount && !(vis[batchEnd].type == Ty(T::Go) && vis[batchEnd].start >= caret)) ++batchEnd;
-    const ScriptTokens tokens(sql, vis, std::min(visCount, batchEnd + 1));
+    while (batchEnd < visible->size() &&
+           !((*visible)[batchEnd].type == Ty(T::Go) && (*visible)[batchEnd].start >= caret))
+        ++batchEnd;
+    const size_t tokenCount = std::min(visible->size(), batchEnd + 1);
 
     // Parse from where the parse of the whole text starts the statement that holds the token before
     // the caret (a statement or batch boundary of it), so that the parse also offers what continues
@@ -1084,13 +1219,15 @@ CompletionResult CompleteAt(Buffer& buffer, size_t caret, const Catalog& catalog
     size_t before = 0;
     ResumePoint from;
     if (caretTok > 0) {
-        const size_t own = caretTok < visToTok.size() ? visToTok[caretTok] : buffer.Tokens().size();
-        before = tokens.Type(caretTok - 1) == Ty(T::Go) ? own : visToTok[caretTok - 1];
+        // (no visible token at or after the caret: everything is lexed)
+        const size_t own = caretTok < visToTok.size() ? visToTok[caretTok] : all.size();
+        before = (*visible)[caretTok - 1].type == Ty(T::Go) ? own : visToTok[caretTok - 1];
         buffer.EnsureParsed(before, before + 1);
         // a point the text's parse reached only by looking at the caret or past it (a look-ahead
         // decision that read on) may not be one of the text up to the caret
         from = buffer.ResumeAtOrBefore(before, limit);
     }
+    const ScriptTokens tokens(sql, visible->data(), tokenCount);
     auto parseFrom = [&](const ResumePoint& at) { return g.ParseToCaret(buffer.View(), at, limit); };
     size_t parseTok = visibleIndexOf(from.token);
     std::unique_ptr<CaretSession> session = parseFrom(from);
@@ -1149,9 +1286,14 @@ CompletionResult CompleteAt(Buffer& buffer, size_t caret, const Catalog& catalog
     if (trialTok < caretTok && ctx.AnyKeywordOnly(kAfterStatement | kColumnStart) &&
         !StatementCanEnd(g, sql, tokens.At(trialTok).start, word.start))
         ctx.DropKeywords([](uint8_t paths) { return !(paths & kInStatement); });
-    if (trialTok < caretTok) {
-        const std::vector<std::string> rejected =
-            RepeatedKeywordsRejected(g, sql, tokens, trialTok, caretTok, tokens.At(trialTok).start, word.start, ctx.keywords);
+    // keywords only paths the walk cannot decide reached (an option given twice, a value an action
+    // rejects, ...): a trial parse each, if the text up to the caret parses (after a syntax error
+    // every trial would fail); from the statement the parse resumed at when a path in doubt left
+    // the inner statement (its text alone does not parse with what follows its end)
+    const size_t doubtTok = ctx.doubtBeyond ? parseTok : trialTok;
+    if (doubtTok <= caretTok && !ps.syntaxErrors) {
+        const std::vector<std::string> rejected = DoubtfulKeywordsRejected(
+            g, sql, doubtTok < caretTok ? tokens.At(doubtTok).start : word.start, word.start, caretTok - doubtTok, ctx);
         if (!rejected.empty())
             ctx.keywords.erase(std::remove_if(ctx.keywords.begin(), ctx.keywords.end(),
                                               [&](const auto& k) {

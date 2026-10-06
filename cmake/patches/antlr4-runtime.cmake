@@ -1,0 +1,41 @@
+# Local fixes to the pinned ANTLR 4.13.2 C++ runtime, held to the same warning bar as libtsql.
+# Run by FetchContent's PATCH_COMMAND in the extracted source root (cmake -P, no other tools):
+#   cmake [-DTSQL_PATCH_HASH=<sha256 of this file>] -P antlr4-runtime.cmake
+# (TSQL_PATCH_HASH is unused here: it only puts this file's content into the patch command, so an
+# edit re-runs the patch step.)
+# Each fix replaces one exact piece of upstream text, marked [libtsql]; a fix already present is
+# skipped (re-configure, re-population), and text matching neither side stops the configure (the
+# pin changed: re-check the fix against the new release). Drop a fix once upstream carries it;
+# antlr/antlr4 dev still has both as of 2026-10-05 (7d57703).
+cmake_minimum_required(VERSION 3.28)
+
+function(tsql_patch file old new)
+    set(path "${CMAKE_CURRENT_SOURCE_DIR}/${file}")
+    file(READ "${path}" text)
+    string(FIND "${text}" "${new}" done)
+    if(NOT done EQUAL -1)
+        return()
+    endif()
+    string(FIND "${text}" "${old}" at)
+    if(at EQUAL -1)
+        message(FATAL_ERROR "antlr4-runtime.cmake: ${file} has neither the upstream nor the patched text")
+    endif()
+    string(REPLACE "${old}" "${new}" text "${text}")
+    file(WRITE "${path}" "${text}")
+    message(STATUS "antlr4-runtime.cmake: patched ${file}")
+endfunction()
+
+# -Wdeprecated-declarations: defining the deprecated, unused Vocabulary::EMPTY_VOCABULARY warns in
+# every build. Nothing in the runtime, the generated parsers or libtsql uses it (the default
+# constructor replaces it), so it goes.
+tsql_patch(runtime/Cpp/runtime/src/Vocabulary.h
+    "    [[deprecated(\"Use the default constructor of Vocabulary instead.\")]] static const Vocabulary EMPTY_VOCABULARY;\n"
+    "    // [libtsql] deprecated EMPTY_VOCABULARY removed (unused; its definition warned)\n")
+tsql_patch(runtime/Cpp/runtime/src/Vocabulary.cpp
+    "const Vocabulary Vocabulary::EMPTY_VOCABULARY;\n"
+    "// [libtsql] deprecated EMPTY_VOCABULARY removed (unused; its definition warned)\n")
+
+# -Wunused-parameter: the generated XPathLexer::IDAction never reads `context`.
+tsql_patch(runtime/Cpp/runtime/src/tree/xpath/XPathLexer.cpp
+    "void XPathLexer::IDAction(antlr4::RuleContext *context, size_t actionIndex) {\n"
+    "void XPathLexer::IDAction(antlr4::RuleContext * /*context*/, size_t actionIndex) { // [libtsql] unused parameter\n")

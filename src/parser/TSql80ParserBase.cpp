@@ -1,5 +1,6 @@
 // Ported from Microsoft SqlScriptDOM (MIT) @ eaf3a6e: SqlScriptDom/Parser/TSql/TSql80ParserBaseInternal.cs
 #include "TSql80ParserBase.h"
+#include "ParserRuntime.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,7 +14,28 @@ namespace {
 [[maybe_unused]] constexpr size_t TT(ast::TSqlTokenType t) { return static_cast<size_t>(t); }
 using TK = ast::TSqlTokenType;
 [[maybe_unused]] constexpr size_t kEOF = antlr4::Token::EOF;
+
+/// CommonToken::_text, read without a copy: the text a token was given, empty when it has none
+/// (getText() then decodes it from the input stream). BuildScriptTokens gives every lexer token its
+/// text, and the editor makes its tokens with theirs. Every token is a CommonToken, the ANTLR
+/// runtime's only Token (this project's FullStreamIndexToken and SessionToken derive from it).
+struct TokenTextAccess : antlr4::CommonToken {
+    static const std::string& Of(const antlr4::Token* token) {
+        return static_cast<const antlr4::CommonToken*>(token)->*(&TokenTextAccess::_text);
+    }
+};
 }  // namespace
+
+bool TSql80ParserBase::TextMatches(const antlr4::Token* token, std::string_view keyword) {
+    const std::string& text = TokenTextAccess::Of(token);
+    return text.empty() ? EqualsIgnoreCase(token->getText(), keyword) : EqualsIgnoreCase(text, keyword);
+}
+
+bool TSql80ParserBase::SynPredMayMatch(size_t rule) {
+    // UseSimulator keeps the strategy's simulator the parser's (no dynamic_cast per predicate)
+    TSqlParserATNSimulator* sim = static_cast<TSqlBailErrorStrategy&>(*_errHandler).simulator;
+    return sim == nullptr || sim->SynPredMayMatch(rule, _input);
+}
 
 TSql80ParserBase::TSql80ParserBase(antlr4::TokenStream* input) : antlr4::Parser(input) {
     setErrorHandler(std::make_shared<TSqlBailErrorStrategy>());
@@ -28,12 +50,11 @@ void TSql80ParserBase::InitializeForNewInput(const ast::ScriptTokenStream* token
     // swap in the simulator with ANTLR 2 no-viable-alternative semantics (same ATN/DFA cache)
     auto* sim = getInterpreter<antlr4::atn::ParserATNSimulator>();
     auto* ours = new TSqlParserATNSimulator(this, sim->atn, sim->decisionToDFA, sim->getSharedContextCache());
-    delete _interpreter;
-    _interpreter = ours;
+    UseSimulator(ours);
     // SLL prediction: SqlScriptDOM's ANTLR 2 parser decided with two tokens of lookahead plus
-    // ordered syntactic predicates, never full-context lookahead. Against full LL: identical on
-    // every valid corpus, 7 of 1,914 broken scripts reported an error at another token, and full
-    // LL took up to 20x longer on scripts with errors.
+    // ordered syntactic predicates, never full-context lookahead, and the simulator checks every
+    // prediction against those decisions (TSqlParserATNSimulator::adaptivePredict). Full LL took up
+    // to 20x longer on scripts with errors.
     ours->setPredictionMode(antlr4::atn::PredictionMode::SLL);
 
     _scriptTokens = tokens;
@@ -42,6 +63,12 @@ void TSql80ParserBase::InitializeForNewInput(const ast::ScriptTokenStream* token
     _fragmentFactory = factory;
     _initialQuotedIdentifiersOn = initialQuotedIdentifiersOn;
     _quotedIdentifier = initialQuotedIdentifiersOn;
+}
+
+void TSql80ParserBase::UseSimulator(TSqlParserATNSimulator* sim) {
+    delete _interpreter;
+    _interpreter = sim;
+    static_cast<TSqlBailErrorStrategy&>(*_errHandler).simulator = sim;
 }
 
 void TSql80ParserBase::ResetQuotedIdentifiersSettingToInitial() { SetQuotedIdentifier(_initialQuotedIdentifiersOn); }
@@ -137,11 +164,11 @@ void TSql80ParserBase::ThrowPartialAstIfPhaseOne(ast::TSqlStatement*) {
 }
 
 bool TSql80ParserBase::NextTokenMatches(const std::string& keyword) {
-    return LA(1) != kEOF && EqualsIgnoreCase(LT(1)->getText(), keyword);
+    return LA(1) != kEOF && TextMatches(LT(1), keyword);
 }
 
 bool TSql80ParserBase::NextTokenMatches(const std::string& keyword, int which) {
-    return LA(which) != kEOF && EqualsIgnoreCase(LT(which)->getText(), keyword);
+    return LA(which) != kEOF && TextMatches(LT(which), keyword);
 }
 
 void TSql80ParserBase::AddBinaryExpression(ast::ScalarExpression*& result, ast::ScalarExpression* expression,
@@ -283,10 +310,10 @@ bool TSql80ParserBase::IsNextRuleBooleanParenthesis() {
         bool isIIfOpeningParen = pendingIIf && t == TT(TK::LeftParenthesis);
         pendingIIf = false;
         if (t == TT(TK::Identifier)) {
-            const std::string text = LT(k)->getText();
-            if (EqualsIgnoreCase(text, CodeGenerationSupporter::IIf)) {
+            const antlr4::Token* token = LT(k);
+            if (TextMatches(token, CodeGenerationSupporter::IIf)) {
                 pendingIIf = true;
-            } else if (EqualsIgnoreCase(text, CodeGenerationSupporter::RegexpLike)) {
+            } else if (TextMatches(token, CodeGenerationSupporter::RegexpLike)) {
                 if (caseDepth == 0 && topmostSelect == 0 && iifParenLevels.empty()) return true;
             }
         } else if (t == TT(TK::LeftParenthesis)) {
@@ -315,7 +342,7 @@ bool TSql80ParserBase::IsNextRuleBooleanParenthesis() {
 }
 
 void TSql80ParserBase::Match(antlr4::Token* token, const std::string& keyword) {
-    if (!EqualsIgnoreCase(token->getText(), keyword))
+    if (!TextMatches(token, keyword))
         ThrowParseErrorException("SQL46005", token, TSqlParserResource::SQL46005Message, keyword, TokenText(token));
 }
 
@@ -329,12 +356,12 @@ void TSql80ParserBase::Match(ast::Identifier* id, const std::string& constant, a
 }
 
 void TSql80ParserBase::Match(antlr4::Token* token, const std::string& keyword, const std::string& alternate) {
-    if (!EqualsIgnoreCase(token->getText(), keyword) && !EqualsIgnoreCase(token->getText(), alternate))
+    if (!TextMatches(token, keyword) && !TextMatches(token, alternate))
         throw GetUnexpectedTokenErrorException(token);
 }
 
 bool TSql80ParserBase::TryMatch(antlr4::Token* token, const std::string& keyword) {
-    return EqualsIgnoreCase(token->getText(), keyword);
+    return TextMatches(token, keyword);
 }
 
 bool TSql80ParserBase::TryMatch(ast::Identifier* identifier, const std::string& keyword) {
@@ -605,17 +632,6 @@ TSqlParseErrorException TSql80ParserBase::GetUnexpectedTokenErrorException(ast::
         CreateParseError("SQL46010", GetFirstToken(identifier), TSqlParserResource::SQL46010Message, text));
 }
 
-antlr4::Token* TSql80ParserBase::ErrorToken(const antlr4::RecognitionException& exception) {
-    antlr4::Token* offending = exception.getOffendingToken();
-    auto* nva = dynamic_cast<const antlr4::NoViableAltException*>(&exception);
-    if (nva == nullptr || offending == nullptr || nva->getStartToken() == nullptr) return offending;
-    antlr4::Token* start = nva->getStartToken();
-    int onChannel = 0;   // default-channel tokens after the decision start up to the offending one
-    for (size_t i = start->getTokenIndex() + 1; i <= offending->getTokenIndex() && i < _fullTokens->size(); ++i)
-        if ((*_fullTokens)[i]->getChannel() == antlr4::Token::DEFAULT_CHANNEL) ++onChannel;
-    return onChannel < 2 ? start : offending;
-}
-
 int TSql80ParserBase::LastTokenOffset() { return PositionOf(LT(1)).Offset; }
 
 // TSql80ParserBaseInternal.cs:1946 (12 C# lines)
@@ -739,10 +755,10 @@ bool TSql80ParserBase::NextTokenMatchesOneOf(const std::vector<std::string>& key
             if (LA(1) == antlr4::Token::EOF)
                 return false;
 
-            std::string text = LT(1)->getText();
-            for (std::string keyword : keywords)
+            const antlr4::Token* token = LT(1);
+            for (const std::string& keyword : keywords)
             {
-                if (String_Equals(keyword, text, StringComparison::OrdinalIgnoreCase))
+                if (TextMatches(token, keyword))
                     return true;
             }
 

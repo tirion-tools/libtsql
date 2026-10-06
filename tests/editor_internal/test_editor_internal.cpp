@@ -4,6 +4,7 @@
 // its text), and Warm running concurrently with Documents. The contract tests are in tests/editor.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <set>
 #include <string>
@@ -13,6 +14,7 @@
 
 #include "Buffer.h"
 #include "Builtins.h"
+#include "Editor.h"
 #include "Grammar.h"
 #include "Names.h"
 #include "Scope.h"
@@ -590,6 +592,194 @@ void TestErrorInCreateOrAlterBody() {
     }
 }
 
+/// ParseAhead interleaved at random with edits and queries (a call parses one statement, or all of
+/// the text): a Document's results equal those of a Document that never ran it.
+void TestParseAheadChangesNoResult() {
+    using namespace tsql::editor;
+    const Catalog catalog = SmallCatalog();
+    uint32_t seed = 4242;
+    auto next = [&](uint32_t n) {
+        seed = seed * 1103515245u + 12345u;
+        return n == 0 ? 0u : (seed >> 8) % n;
+    };
+    int mismatches = 0;
+    for (SqlVersion version : {SqlVersion::Sql170, SqlVersion::Sql130}) {
+        for (const char* script : kScripts) {
+            Document plain(version), ahead(version);
+            plain.SetText(script);
+            ahead.SetText(script);
+            auto parseAhead = [&] {
+                for (uint32_t n = next(4); n > 0; --n)
+                    ahead.ParseAhead(next(8) == 0 ? std::chrono::steady_clock::duration(std::chrono::hours(1))
+                                                  : std::chrono::steady_clock::duration::zero());
+            };
+            for (int step = 0; step < 60 && mismatches < 5; ++step) {
+                parseAhead();
+                const std::string& text = plain.Text();
+                const size_t at = next(static_cast<uint32_t>(text.size() + 1));
+                const size_t remove = next(4) == 0 ? next(static_cast<uint32_t>(std::min<size_t>(12, text.size() - at) + 1)) : 0;
+                const char* insert = next(5) == 0 ? "" : kFragments[next(sizeof(kFragments) / sizeof(kFragments[0]))];
+                plain.Edit(at, remove, insert);
+                ahead.Edit(at, remove, insert);
+                parseAhead();
+                const std::string now = plain.Text();
+                const size_t vs = next(static_cast<uint32_t>(now.size() + 1));
+                const size_t ve = std::min(now.size(), vs + next(80));
+                std::string what;
+                if (!SameSpans(ahead.Classify(vs, ve), plain.Classify(vs, ve))) what += " viewport Classify";
+                parseAhead();
+                const size_t caret = next(static_cast<uint32_t>(now.size() + 1));
+                if (!SameCompletion(ahead.Complete(caret, catalog), plain.Complete(caret, catalog))) what += " Complete";
+                if (step % 3 == 0 && !SameSpans(ahead.Classify(0, now.size()), plain.Classify(0, now.size())))
+                    what += " full Classify";
+                if (!what.empty()) {
+                    ++mismatches;
+                    std::printf("%s: ParseAhead changed%s after %d edits (last: %zu,%zu,'%s'), viewport [%zu,%zu), "
+                                "caret %zu:\n%s\n",
+                                GrammarName(version), what.c_str(), step + 1, at, remove, insert, vs, ve, caret, now.c_str());
+                }
+            }
+        }
+    }
+    CHECK_EQ(mismatches, 0);
+}
+
+/// ParseAhead parses in slices that end at resume points; once it returns true, queries anywhere
+/// parse nothing more; an edit gives it work again, and its parse then equals a fresh one.
+void TestParseAheadFinishes() {
+    using namespace tsql::editor;
+    using Clock = std::chrono::steady_clock;
+    const Catalog catalog = SmallCatalog();
+    std::string nogo, go;
+    for (int i = 0; i < 200; ++i) {
+        const std::string s = "SELECT o.OrderID FROM dbo.Orders AS o WHERE o.Status = " + std::to_string(i) + ";\n";
+        nogo += s;
+        go += s + (i % 10 == 9 ? "GO\n" : "");
+    }
+    go += "GO";   // a trailing GO: a query after it parses the (empty) region there
+    for (const std::string& script : {nogo, go}) {
+        Buffer b(G());
+        b.SetText(script);
+        CHECK(b.Lexed().empty());   // lexed as the parse reads on
+        CHECK(!b.ParseAhead(Clock::now()));
+        CHECK(!b.Lexed().empty() && b.Lexed().back().end < script.size());
+        size_t calls = 1;
+        while (!b.ParseAhead(Clock::now()) && calls < 10000) ++calls;
+        CHECK(calls >= 100 && calls < 10000);   // an expired budget: one statement per call
+        const size_t parses = b.ParseCount();
+        for (size_t caret : {size_t{0}, script.size() / 2, script.find("= 150") + 2, script.size()})
+            CompleteAt(b, caret, catalog);
+        ClassifyRange(b, 0, script.size());
+        CHECK_EQ(b.ParseCount(), parses);
+        CHECK(b.ParseAhead(Clock::now()));
+        CHECK_EQ(b.ParseCount(), parses);
+
+        // QUOTED_IDENTIFIER OFF changes the state of every later resume point of the batch
+        b.Edit(script.find("SELECT o.OrderID FROM dbo.Orders AS o WHERE o.Status = 100;"), 0, "SET QUOTED_IDENTIFIER OFF\n");
+        CHECK(!b.ParseAhead(Clock::now()));
+        while (!b.ParseAhead(Clock::now())) {}
+        const size_t reparsed = b.ParseCount();
+        const std::string text = b.Text();
+        CHECK(SameSpans(ClassifyRange(b, 0, text.size()), Classify(text, SqlVersion::Sql170)));
+        const size_t caret = text.find("= 150") + 2;
+        CHECK(SameCompletion(CompleteAt(b, caret, catalog), Complete(text, caret, SqlVersion::Sql170, catalog)));
+        CHECK_EQ(b.ParseCount(), reparsed);
+    }
+}
+
+/// The text is lexed only as far as needed: after random edits (before, at and past the last token
+/// lexed) and range queries, the tokens lexed so far are a prefix of a fresh lex of the text that,
+/// unless it is all of it, ends with a parser-visible token other than GO; colouring a range equals
+/// the free function's.
+void TestLazyLex() {
+    std::string base;
+    for (int i = 0; i < 20; ++i)
+        for (const char* s : kScripts) base += s;   // about 20 KB: several of the lexer's chunks
+    uint32_t seed = 99;
+    auto next = [&](uint32_t n) {
+        seed = seed * 1103515245u + 12345u;
+        return n == 0 ? 0u : (seed >> 8) % n;
+    };
+    int mismatches = 0;
+    for (int round = 0; round < 4 && mismatches < 5; ++round) {
+        Buffer b(G());
+        b.SetText(base);
+        std::string text = base;
+        for (int step = 0; step < 30 && mismatches < 5; ++step) {
+            const size_t lexEnd = b.Lexed().empty() ? 0 : b.Lexed().back().end;
+            size_t at = next(3) == 0 ? lexEnd + next(9) : next(static_cast<uint32_t>(text.size() + 1));
+            at = std::min(at >= 4 ? at - 4 : 0, text.size());
+            const size_t remove = next(3) == 0 ? std::min<size_t>(next(20), text.size() - at) : 0;
+            // (some edits make or break UTF-8 sequences: the validity Edit keeps must be the text's)
+            static const char* const kUtf8[] = {"\xC3\xA9", "\xE2\x82\xAC", "\xC3", "\xA9", "\xE2\x82", "\xF0\x9F\x98\x80"};
+            const std::string insert = next(5) == 0 ? kUtf8[next(sizeof(kUtf8) / sizeof(kUtf8[0]))]
+                                       : next(4) == 0 ? ""
+                                                      : kFragments[next(sizeof(kFragments) / sizeof(kFragments[0]))];
+            b.Edit(at, remove, insert);
+            text.replace(at, remove, insert);
+            if (next(2) == 0) {
+                const size_t vs = next(static_cast<uint32_t>(text.size() + 1));
+                const size_t ve = std::min(text.size(), vs + next(400));
+                std::vector<tsql::editor::ColouredSpan> expected;
+                for (const auto& s : tsql::editor::Classify(text, SqlVersion::Sql170))
+                    if (vs < ve && s.start < ve && s.start + s.length > vs) expected.push_back(s);
+                if (!SameSpans(ClassifyRange(b, vs, ve), expected)) {
+                    ++mismatches;
+                    std::printf("lazy lexing: range [%zu,%zu) coloured differently after edit %zu,%zu,'%s'\n", vs, ve, at,
+                                remove, insert.c_str());
+                }
+            }
+            std::vector<LexToken> fresh;
+            G().Lex(text, fresh);
+            const std::vector<LexToken>& lexed = b.Lexed();
+            bool same = b.Text() == text && lexed.size() <= fresh.size();
+            for (size_t i = 0; same && i < lexed.size(); ++i)
+                same = lexed[i].type == fresh[i].type && lexed[i].start == fresh[i].start && lexed[i].end == fresh[i].end;
+            if (same && lexed.size() < fresh.size() && !lexed.empty())
+                same = !IsHiddenType(lexed.back().type) && lexed.back().type != static_cast<uint32_t>(ast::TSqlTokenType::Go);
+            if (!same) {
+                ++mismatches;
+                std::printf("lazy lexing: the tokens lexed (%zu) are not a prefix of a fresh lex after edit %zu,%zu,'%s'\n",
+                            lexed.size(), at, remove, insert.c_str());
+            }
+            // the parser-visible tokens are those of the tokens lexed
+            const std::vector<LexToken>& visible = b.Visible();
+            const std::vector<uint32_t>& toToken = b.VisibleToToken();
+            size_t v = 0;
+            bool sameVisible = visible.size() == toToken.size();
+            for (size_t i = 0; sameVisible && i < lexed.size(); ++i) {
+                if (IsHiddenType(lexed[i].type)) continue;
+                sameVisible = v < visible.size() && toToken[v] == i && visible[v].type == lexed[i].type &&
+                              visible[v].start == lexed[i].start && visible[v].end == lexed[i].end;
+                ++v;
+            }
+            std::string sanitized;
+            if (!sameVisible || v != visible.size() || b.View().invalidUtf8 != SanitizeUtf8(text, sanitized)) {
+                ++mismatches;
+                std::printf("lazy lexing: visible tokens or UTF-8 validity differ after edit %zu,%zu,'%s'\n", at, remove,
+                            insert.c_str());
+            }
+        }
+    }
+    CHECK_EQ(mismatches, 0);
+}
+
+/// editor_meta.py's action tables map 1:1 onto each grammar's ATN actions (its .g4 reading and the
+/// ATN builder's numbering agree): otherwise a converter or ANTLR change would silently mark every
+/// action of a rule as rejecting, or the wrong ones. The tables are not empty, and the WINDOW alias
+/// check (TSql160 on) is a returning action.
+void TestRuleActionTables() {
+    for (SqlVersion v : {SqlVersion::Sql130, SqlVersion::Sql140, SqlVersion::Sql150, SqlVersion::Sql160,
+                         SqlVersion::Sql170, SqlVersion::Sql180, SqlVersion::SqlFabricDW}) {
+        if (!IsParserAvailable(v)) continue;
+        const Grammar& g = GrammarFor(v);
+        CHECK_EQ(g.actionTableMismatches, size_t{0});
+        CHECK(std::count(g.rejectingAction.begin(), g.rejectingAction.end(), 1) > 100);
+        if (v != SqlVersion::Sql130 && v != SqlVersion::Sql140 && v != SqlVersion::Sql150)
+            CHECK(!g.returningAction.empty());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -607,7 +797,11 @@ int main() {
     TestDocumentMatchesFreeFunctions();
     TestDocumentReusesTheParse();
     TestBatchesParsedIndependently();
+    TestLazyLex();
     TestWarmConcurrently();
+    TestParseAheadChangesNoResult();
+    TestParseAheadFinishes();
+    TestRuleActionTables();
     if (failures != 0) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

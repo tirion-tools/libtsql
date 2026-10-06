@@ -24,6 +24,22 @@ bool HasInvalidUtf8(std::string_view s) {
 }
 }  // namespace
 
+void Buffer::ReplaceText(size_t start, size_t length, std::string_view replacement) {
+    text_.replace(start, length, replacement.data(), replacement.size());
+    if (invalidUtf8_) {
+        invalidUtf8_ = HasInvalidUtf8(text_);
+        return;
+    }
+    // the text was valid: only the sequences around the replaced bytes can break (a sequence
+    // spans at most 4 bytes; outside continuation bytes every byte starts one)
+    auto continuation = [&](size_t i) { return (static_cast<unsigned char>(text_[i]) & 0xC0) == 0x80; };
+    size_t from = start >= 4 ? start - 4 : 0;
+    while (from < start && continuation(from)) ++from;
+    size_t to = start + replacement.size();
+    for (int k = 0; k < 4 && to < text_.size() && continuation(to); ++k) ++to;
+    invalidUtf8_ = HasInvalidUtf8(std::string_view(text_).substr(from, to - from));
+}
+
 void Buffer::SetText(std::string_view sql) {
     text_.assign(sql.data(), sql.size());
     invalidUtf8_ = HasInvalidUtf8(text_);
@@ -31,19 +47,67 @@ void Buffer::SetText(std::string_view sql) {
     dual_.clear();
     lookEnd_.clear();
     goAfter_.clear();
-    grammar_->LexFrom(text_, 0, true, [&](const LexedToken& t) {
-        tokens_.push_back(t.token);
-        dual_.push_back(t.dualQuoted);
-        lookEnd_.push_back(std::max(t.lookEnd, lookEnd_.empty() ? 0u : lookEnd_.back()));
-        goAfter_.push_back(t.goAfter);
-        return true;
-    });
-    visibleValid_ = false;
     gos_.clear();
-    for (size_t i = 0; i < tokens_.size(); ++i)
-        if (tokens_[i].type == static_cast<uint32_t>(ast::TSqlTokenType::Go)) gos_.push_back(static_cast<uint32_t>(i));
-    roles_.assign(tokens_.size(), TokenRole{});
+    roles_.clear();
+    lexEnd_ = 0;
+    lexGo_ = true;
+    lexedAll_ = false;
+    visible_.clear();
+    visibleToToken_.clear();
     runs_.clear();
+}
+
+namespace {
+constexpr size_t kLexChunk = 4 * 1024;   // a parse that reads past the tokens lexed lexes this much more
+
+bool IsGo(uint32_t type) { return type == static_cast<uint32_t>(ast::TSqlTokenType::Go); }
+}  // namespace
+
+void Buffer::Append(const LexedToken& t) {
+    if (IsGo(t.token.type)) gos_.push_back(static_cast<uint32_t>(tokens_.size()));
+    if (!IsHiddenType(t.token.type)) {
+        visible_.push_back(t.token);
+        visibleToToken_.push_back(static_cast<uint32_t>(tokens_.size()));
+    }
+    tokens_.push_back(t.token);
+    dual_.push_back(t.dualQuoted);
+    lookEnd_.push_back(std::max(t.lookEnd, lookEnd_.empty() ? 0u : lookEnd_.back()));
+    goAfter_.push_back(t.goAfter);
+    roles_.emplace_back();
+    lexEnd_ = t.token.end;
+    lexGo_ = t.goAfter;
+}
+
+void Buffer::LexMore(size_t until) {
+    if (lexedAll_) return;
+    bool stopped = false;
+    grammar_->LexFrom(text_, lexEnd_, lexGo_, [&](const LexedToken& t) {
+        Append(t);
+        if (t.token.start < until || IsHiddenType(t.token.type) || IsGo(t.token.type)) return true;
+        stopped = true;
+        return false;
+    });
+    lexedAll_ = !stopped;
+}
+
+void Buffer::LexTo(size_t offset) {
+    if (!lexedAll_ && (tokens_.empty() || tokens_.back().start < offset)) LexMore(offset);
+}
+
+void Buffer::LexBatchOf(size_t offset) {
+    LexTo(offset);
+    while (!lexedAll_ && (gos_.empty() || tokens_[gos_.back()].start < offset)) LexMore(lexEnd_ + kLexChunk);
+}
+
+const std::vector<LexToken>& Buffer::Tokens() {
+    LexMore(SIZE_MAX);
+    return tokens_;
+}
+
+bool Buffer::MoreTokens() {
+    const size_t before = tokens_.size();
+    LexMore(lexEnd_ + kLexChunk);
+    return tokens_.size() > before;
 }
 
 void Buffer::Edit(size_t start, size_t length, std::string_view replacement) {
@@ -53,15 +117,20 @@ void Buffer::Edit(size_t start, size_t length, std::string_view replacement) {
 
     // ---- tokens: lex again from the end of the last token whose lexing did not look at the edit
     const size_t first = static_cast<size_t>(std::upper_bound(lookEnd_.begin(), lookEnd_.end(), start) - lookEnd_.begin());
+    if (!lexedAll_ && first == tokens_.size()) {
+        // no token lexed so far looked at the edit: the text from there on is lexed when needed
+        ReplaceText(start, length, replacement);
+        return;
+    }
     const size_t restart = first > 0 ? tokens_[first - 1].end : 0;
     const bool go = first > 0 ? goAfter_[first - 1] != 0 : true;
     const auto delta = static_cast<std::ptrdiff_t>(replacement.size()) - static_cast<std::ptrdiff_t>(length);
     const size_t newEditEnd = start + replacement.size();
-    text_.replace(start, length, replacement.data(), replacement.size());
-    invalidUtf8_ = HasInvalidUtf8(text_);
+    ReplaceText(start, length, replacement);
 
     std::vector<LexedToken> fresh;
     size_t resync = SIZE_MAX;   // the old token the new tokens resynchronise with
+    bool frontier = false;      // or the new tokens reached the end of those lexed before
     grammar_->LexFrom(text_, restart, go, [&](const LexedToken& t) {
         fresh.push_back(t);
         if (t.token.end < newEditEnd) return true;
@@ -70,26 +139,50 @@ void Buffer::Edit(size_t start, size_t length, std::string_view replacement) {
         const auto oldEnd = static_cast<uint32_t>(static_cast<std::ptrdiff_t>(t.token.end) - delta);
         auto it = std::lower_bound(tokens_.begin() + static_cast<std::ptrdiff_t>(first), tokens_.end(), oldEnd,
                                    [](const LexToken& a, uint32_t e) { return a.end < e; });
-        if (it == tokens_.end() || it->end != oldEnd) return true;
-        const size_t k = static_cast<size_t>(it - tokens_.begin());
-        if ((goAfter_[k] != 0) != t.goAfter) return true;
-        resync = k;
-        return false;
+        if (it != tokens_.end() && it->end == oldEnd) {
+            const size_t k = static_cast<size_t>(it - tokens_.begin());
+            // (the last token lexed stays parser-visible and not GO, else lexing goes on)
+            const bool keepsLast = lexedAll_ || k + 1 < tokens_.size() ||
+                                   (!IsHiddenType(t.token.type) && !IsGo(t.token.type));
+            if ((goAfter_[k] != 0) == t.goAfter && keepsLast) {
+                resync = k;
+                return false;
+            }
+        }
+        // past all the old tokens (the text after them was not lexed): stop where lexing may stop
+        if (!lexedAll_ && oldEnd >= lexEnd_ && !IsHiddenType(t.token.type) && !IsGo(t.token.type)) {
+            frontier = true;
+            return false;
+        }
+        return true;
     });
+    if (resync != SIZE_MAX) {
+        lexEnd_ = static_cast<uint32_t>(lexEnd_ + delta);   // the last token lexed is at or after the resync
+    } else {
+        lexedAll_ = !frontier;
+        lexEnd_ = fresh.empty() ? static_cast<uint32_t>(restart) : fresh.back().token.end;
+        lexGo_ = fresh.empty() ? go : fresh.back().goAfter;
+    }
     const size_t oldEnd = resync == SIZE_MAX ? tokens_.size() : resync + 1;   // old tokens [first, oldEnd) are replaced
     const size_t count = fresh.size();
     const size_t newEnd = first + count;
     const auto shift = static_cast<std::ptrdiff_t>(newEnd) - static_cast<std::ptrdiff_t>(oldEnd);
 
-    auto splice = [&](auto& v, const auto& value) {
-        v.erase(v.begin() + static_cast<std::ptrdiff_t>(first), v.begin() + static_cast<std::ptrdiff_t>(oldEnd));
-        v.insert(v.begin() + static_cast<std::ptrdiff_t>(first), count, value);
+    // old [first, oldEnd) becomes new [first, newEnd): one move of the tail, if any
+    auto splice = [&](auto& v) {
+        using T = typename std::decay_t<decltype(v)>::value_type;
+        if (newEnd > oldEnd) v.insert(v.begin() + static_cast<std::ptrdiff_t>(oldEnd), newEnd - oldEnd, T{});
+        else v.erase(v.begin() + static_cast<std::ptrdiff_t>(newEnd), v.begin() + static_cast<std::ptrdiff_t>(oldEnd));
     };
-    splice(tokens_, LexToken{});
-    splice(dual_, uint8_t{0});
-    splice(lookEnd_, uint32_t{0});
-    splice(goAfter_, uint8_t{0});
-    splice(roles_, TokenRole{});
+    if (newEnd != oldEnd) {
+        splice(tokens_);
+        splice(dual_);
+        splice(lookEnd_);
+        splice(goAfter_);
+        splice(roles_);
+    }
+    std::fill(roles_.begin() + static_cast<std::ptrdiff_t>(first), roles_.begin() + static_cast<std::ptrdiff_t>(newEnd),
+              TokenRole{});
     for (size_t k = 0; k < count; ++k) {
         tokens_[first + k] = fresh[k].token;
         dual_[first + k] = fresh[k].dualQuoted;
@@ -100,10 +193,13 @@ void Buffer::Edit(size_t start, size_t length, std::string_view replacement) {
         LexToken& t = tokens_[k];
         t.start = static_cast<uint32_t>(t.start + delta);
         t.end = static_cast<uint32_t>(t.end + delta);
-        lookEnd_[k] = std::max(static_cast<uint32_t>(lookEnd_[k] + delta), k > 0 ? lookEnd_[k - 1] : 0u);
+        lookEnd_[k] = static_cast<uint32_t>(lookEnd_[k] + delta);
     }
-    // ---- the parser-visible tokens: splice the relexed ones in, shift the rest (no full rebuild)
-    if (visibleValid_) {
+    // (the shifted looks stay non-decreasing among themselves: only those below the new ones rise)
+    for (size_t k = std::max<size_t>(newEnd, 1); k < lookEnd_.size() && lookEnd_[k] < lookEnd_[k - 1]; ++k)
+        lookEnd_[k] = lookEnd_[k - 1];
+    // ---- the parser-visible tokens: splice the relexed ones in, shift the rest
+    {
         const auto vFirst = std::lower_bound(visibleToToken_.begin(), visibleToToken_.end(), static_cast<uint32_t>(first)) -
                             visibleToToken_.begin();
         const auto vOld = std::lower_bound(visibleToToken_.begin() + vFirst, visibleToToken_.end(),
@@ -112,14 +208,21 @@ void Buffer::Edit(size_t start, size_t length, std::string_view replacement) {
         std::vector<uint32_t> added;
         for (size_t k = first; k < newEnd; ++k)
             if (!IsHiddenType(tokens_[k].type)) added.push_back(static_cast<uint32_t>(k));
-        visibleToToken_.erase(visibleToToken_.begin() + vFirst, visibleToToken_.begin() + vOld);
-        visibleToToken_.insert(visibleToToken_.begin() + vFirst, added.begin(), added.end());
-        visible_.erase(visible_.begin() + vFirst, visible_.begin() + vOld);
-        visible_.insert(visible_.begin() + vFirst, added.size(), LexToken{});
-        const size_t from = static_cast<size_t>(vFirst) + added.size();
-        for (size_t j = from; j < visibleToToken_.size(); ++j)
+        const auto vNew = vFirst + static_cast<std::ptrdiff_t>(added.size());
+        if (vNew > vOld) {
+            visibleToToken_.insert(visibleToToken_.begin() + vOld, static_cast<size_t>(vNew - vOld), 0u);
+            visible_.insert(visible_.begin() + vOld, static_cast<size_t>(vNew - vOld), LexToken{});
+        } else if (vNew < vOld) {
+            visibleToToken_.erase(visibleToToken_.begin() + vNew, visibleToToken_.begin() + vOld);
+            visible_.erase(visible_.begin() + vNew, visible_.begin() + vOld);
+        }
+        std::copy(added.begin(), added.end(), visibleToToken_.begin() + vFirst);
+        for (auto j = static_cast<size_t>(vFirst); j < static_cast<size_t>(vNew); ++j) visible_[j] = tokens_[visibleToToken_[j]];
+        for (auto j = static_cast<size_t>(vNew); j < visibleToToken_.size(); ++j) {
             visibleToToken_[j] = static_cast<uint32_t>(static_cast<std::ptrdiff_t>(visibleToToken_[j]) + shift);
-        for (size_t j = static_cast<size_t>(vFirst); j < visible_.size(); ++j) visible_[j] = tokens_[visibleToToken_[j]];
+            visible_[j].start = static_cast<uint32_t>(visible_[j].start + delta);
+            visible_[j].end = static_cast<uint32_t>(visible_[j].end + delta);
+        }
     }
 
     // ---- the parse: runs after the edit's GO stand; a run the edit is in keeps the resume points
@@ -152,25 +255,6 @@ void Buffer::Edit(size_t start, size_t length, std::string_view replacement) {
             if (tokens_[k].type == static_cast<uint32_t>(ast::TSqlTokenType::Go)) added.push_back(static_cast<uint32_t>(k));
         gos_.insert(gos_.erase(lo, hi), added.begin(), added.end());
     }
-}
-
-const std::vector<LexToken>& Buffer::Visible() {
-    if (!visibleValid_) {
-        visible_.clear();
-        visibleToToken_.clear();
-        for (size_t i = 0; i < tokens_.size(); ++i) {
-            if (IsHiddenType(tokens_[i].type)) continue;
-            visible_.push_back(tokens_[i]);
-            visibleToToken_.push_back(static_cast<uint32_t>(i));
-        }
-        visibleValid_ = true;
-    }
-    return visible_;
-}
-
-const std::vector<uint32_t>& Buffer::VisibleToToken() {
-    Visible();
-    return visibleToToken_;
 }
 
 size_t Buffer::TokenAt(size_t offset) const {
@@ -228,15 +312,46 @@ void Buffer::EnsureParsed(size_t first, size_t end) {
 }
 
 void Buffer::Extend(Run& run, size_t end) {
-    while (!run.done && run.points.back().at.token < end) {
+    while (!run.done && run.points.back().at.token < end && !timeUp_) {
         current_ = &run;
         target_ = end;
         pendingKeyword_.clear();
         const size_t before = run.points.size();
+        ++parseCount_;
         grammar_->ParseFrom(View(), run.points.back().at, *this);
         if (run.points.size() == before && !run.done) run.done = true;   // no progress: cannot happen
     }
     current_ = nullptr;
+}
+
+bool Buffer::ParseAhead(std::chrono::steady_clock::time_point deadline) {
+    deadline_ = deadline;
+    timeUp_ = false;
+    // the regions in order; after a trailing GO the (empty) region at the end is parsed too, as a
+    // query there would
+    bool all = false;
+    for (size_t i = 0;;) {
+        const size_t start = RegionStart(i);
+        Run& run = RunAt(start);
+        Extend(run, SIZE_MAX);
+        if (!run.done) break;
+        // the region's GO (not lexed yet when an error ended the parse before it)
+        while (!lexedAll_ && std::lower_bound(gos_.begin(), gos_.end(), static_cast<uint32_t>(start)) == gos_.end() &&
+               std::chrono::steady_clock::now() < deadline)
+            LexMore(lexEnd_ + kLexChunk);
+        if (!lexedAll_ && std::lower_bound(gos_.begin(), gos_.end(), static_cast<uint32_t>(start)) == gos_.end()) break;
+        // (unless everything is lexed, a GO is not the last token lexed)
+        const size_t end = RegionEnd(start);
+        const bool trailingGo = start < end && end == tokens_.size() && IsGo(tokens_[end - 1].type);
+        if (end >= tokens_.size() && !trailingGo) {
+            all = true;
+            break;
+        }
+        i = end;
+    }
+    deadline_ = std::chrono::steady_clock::time_point::max();
+    timeUp_ = false;
+    return all;
 }
 
 void Buffer::Finish(Run& run, uint32_t look) {
@@ -369,7 +484,12 @@ bool Buffer::OnCheckpoint(const ResumePoint& at, size_t lookEnd) {
         if (done) Finish(r, doneLook);
         return false;
     }
-    return at.token < target_;
+    if (at.token >= target_) return false;
+    if (deadline_ != std::chrono::steady_clock::time_point::max() && std::chrono::steady_clock::now() >= deadline_) {
+        timeUp_ = true;   // ParseAhead's budget ran out: stop at this resume point
+        return false;
+    }
+    return true;
 }
 
 void Buffer::OnEnd(size_t index, size_t lookEnd) {

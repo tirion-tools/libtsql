@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "antlr4-runtime.h"
-#include "ParserRuntime.h"
 #include "tsql/ast/ast.hpp"
 #include "CsCompat.h"
 #include "OptionsHelper.h"
@@ -25,6 +24,8 @@ namespace tsql::parser {
 
 namespace ast = ::tsql::ast;
 
+class TSqlParserATNSimulator;
+
 /// Root of the parser-base chain (C#: TSql80ParserBaseInternal : antlr.LLkParser): the
 /// ANTLR 2 runtime shims plus the TSql80 helpers. Each TSql<ver>ParserBase derives from the
 /// previous version like the C# classes; only members some converted grammar uses are ported.
@@ -38,7 +39,19 @@ public:
                                std::vector<ParseError>* errors, ast::FragmentFactory* factory,
                                bool initialQuotedIdentifiersOn);
 
+    /// Whether the ANTLR 2 syntactic predicate whose alternative starts with the reference to
+    /// marker rule `marker` (tools/g2to4/convert.py Converter.load_synpreds) matches here: a
+    /// speculative parse from the current token, with the arguments of `ctx`, the context of the
+    /// rule the predicate is in. Generated; ParserRuntime's emulation of ANTLR 2's decisions calls it.
+    virtual bool Antlr2SynPred(size_t marker, antlr4::ParserRuleContext* ctx) = 0;
+
+    friend class TSqlParserATNSimulator;   // reads Guessing()
+
 protected:
+    /// Installs `sim` (owned; same ATN and DFA cache as the current simulator) as the parser's
+    /// simulator, which the error strategy's sync also uses (TSqlBailErrorStrategy::simulator).
+    void UseSimulator(TSqlParserATNSimulator* sim);
+
     // ------------------------------------------------------------------ ANTLR 2 shims
     size_t LA(int i) { return _input->LA(i); }
     antlr4::Token* LT(int i) { return _input->LT(i); }
@@ -50,10 +63,12 @@ protected:
     /// inputState.guessing != 0: inside a speculative parse, where actions are skipped and
     /// exception handlers rethrow.
     bool Guessing() const { return _guessing != 0; }
-    /// (alternative-prefix)=> : runs the prefix as a speculative parse from the current token and
-    /// rewinds; true when it matched.
+    /// (alternative-prefix)=> : runs the prefix, the converter's rule `rule` (R_synpredN), as a
+    /// speculative parse from the current token and rewinds; true when it matched. The parse is
+    /// skipped when no path through the rule fits the tokens ahead (SynPredMayMatch).
     template <class F>
-    bool Speculate(F parsePrefix) {
+    bool Speculate(size_t rule, F parsePrefix) {
+        if (!SynPredMayMatch(rule)) return false;
         const size_t start = _input->index();
         const size_t state = getState();
         ++_guessing;
@@ -70,6 +85,12 @@ protected:
         setState(state);
         return ok;
     }
+    /// Whether some path through rule `rule`, predicates ignored, matches the tokens ahead up to
+    /// the rule's end: a necessary condition for its speculative parse to match, checked without
+    /// parsing (TSqlParserATNSimulator::SynPredMayMatch).
+    bool SynPredMayMatch(size_t rule);
+    /// Whether `token`'s text equals `keyword` ignoring case (ASCII), without copying the text.
+    static bool TextMatches(const antlr4::Token* token, std::string_view keyword);
 
     // ------------------------------------------------------------------ TSql80ParserBaseInternal
     void ResetQuotedIdentifiersSettingToInitial();
@@ -185,10 +206,12 @@ protected:
     static TSqlParseErrorException GetUnexpectedTokenErrorException(antlr4::Token* token);
     TSqlParseErrorException GetUnexpectedTokenErrorException(ast::Identifier* identifier);
 public:
-    /// antlr.RecognitionException.token. ANTLR 2 (k=2) throws NoViableAlt at LT(1) of the decision
-    /// when the first two tokens already exclude every alternative; otherwise it enters an
-    /// alternative and fails at the offending token, which is what ANTLR 4's ALL(*) reports.
-    antlr4::Token* ErrorToken(const antlr4::RecognitionException& exception);
+    /// antlr.RecognitionException.token: the offending token. ANTLR 2 threw NoViableAlt at LT(1) of
+    /// its decision, and so does every NoViableAlt the parser throws (TSqlParserATNSimulator's
+    /// emulation of ANTLR 2's decisions and ANTLR 4's inline decisions alike).
+    static antlr4::Token* ErrorToken(const antlr4::RecognitionException& exception) {
+        return exception.getOffendingToken();
+    }
 
 protected:
     /// _tokenSource.LastToken.Offset (only used when an exception carries no token).
@@ -210,7 +233,9 @@ protected:
     /// params string[] form
     template <class... K>
     bool NextTokenMatchesOneOf(const char* first, const K&... rest) {
-        return NextTokenMatchesOneOf(std::vector<std::string>{first, rest...});
+        if (LA(1) == antlr4::Token::EOF) return false;
+        const antlr4::Token* token = LT(1);
+        return TextMatches(token, first) || (TextMatches(token, rest) || ...);
     }
     ast::StatisticsOptionKind ParseCreateStatisticsWithOption(antlr4::Token* token);   // TSql80ParserBaseInternal.cs:1689
     ast::IndexOptionKind ParseIndexLegacyWithOption(antlr4::Token* token);   // TSql80ParserBaseInternal.cs:1243

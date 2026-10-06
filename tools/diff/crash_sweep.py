@@ -8,7 +8,8 @@ decoded like tsql_dump, split into rough T-SQL tokens (a word or one other non-s
 the script cut after every TRUNC_EVERY-th token, and the script without every DELETE_EVERY-th token
 (starting at DELETE_FIRST). 44,432 variants, the same for every version, written once to
 $P/sweep/inputs. Each version's tsql_dump (default: every version the build has) parses them
-in batches under $P/bin/capped when present; when a batch dies of a signal (exit >= 128), the
+in batches under $P/bin/capped when present, each tsql_dump limited to 2 GB of address space (a runaway
+aborts on its own allocation, exit 134, instead of being OOM-killed); when a batch dies of a signal (exit >= 128), the
 first file without a dump is recorded and the batch resumes after it. Prints every crashing variant as
 `<version> <exit> <file>`; exits 1 if there is any. About 6 minutes for all seven versions (4 jobs)."""
 import argparse, glob, hashlib, os, re, shutil, subprocess, sys, tempfile
@@ -90,7 +91,7 @@ def main():
     ap.add_argument('--jobs', type=int, default=4)
     a = ap.parse_args()
     dump = a.build + '/src/parser/tsql_dump'
-    cap = [P + '/bin/capped'] if os.access(P + '/bin/capped', os.X_OK) else []
+    cap = ([P + '/bin/capped'] if os.access(P + '/bin/capped', os.X_OK) else []) + ['prlimit', '--as=%d' % (2 << 30)]
     versions = a.version or subprocess.run([dump, '--list-versions'], capture_output=True, text=True,
                                            check=True).stdout.split()
     os.makedirs(WORK, exist_ok=True)

@@ -27,7 +27,8 @@ overrides/<G>/ (one grammar; wins over common):
                          them to the ANTLR 2 rule (required in common: applied only where it matches)
     lexer_rules/*.g4     whole-rule replacements for the lexers
     synpreds.txt         ANTLR 2 syntactic predicates to keep (as speculative parses); all others
-                         are dropped and left to ANTLR 4's unbounded lookahead
+                         are dropped and left to ANTLR 4's unbounded lookahead (a reference to the
+                         empty rule SYNPRED_MARKER marks their alternatives)
 Hand-written C++ the actions call: src/parser/TSql<ver>ParserBase.cpp (the C# base class chain
 TSql80 -> ... -> TSql180, TSqlFabricDW -> TSql150; drafts come from tools/g2to4/portbase.py),
 src/parser/helpers/ (C# helper classes and OptionsHelper members). The output is deterministic.
@@ -59,6 +60,35 @@ HEADER = '// Ported from Microsoft SqlScriptDOM (MIT) @ eaf3a6e: %s\n// GENERATE
 # ANTLR 2 guessing-mode helpers (SaveGuessing/SkipGuessing) only short-circuit nested syntactic
 # predicates; with syntactic predicates gone they are no-ops.
 GUESSING_INIT = re.compile(r'^\s*(if\s*\(\s*!\s*SkipGuessing\(\w+\)\s*\)|SaveGuessing\(\s*out\s+\w+\s*\)\s*;)\s*$')
+
+
+def synpred_marker(name):
+    """The empty rule whose reference starts the alternative of dropped syntactic predicate `name`
+    (see Converter.load_synpreds)."""
+    return 'antlr2SynPred_' + name
+
+
+def rule_const(name):
+    """The generated parser's rule index constant of rule `name` (ANTLR 4 C++ target)."""
+    return 'Rule' + name[0].upper() + name[1:]
+
+
+def top_synpreds(node):
+    """The syntactic predicates under a Block/Alt/element in order, without those nested in one
+    (the order RuleConverter numbers them in)."""
+    if isinstance(node, Block):
+        for a in node.alts:
+            yield from top_synpreds(a)
+    elif isinstance(node, Alt):
+        for e in node.elems:
+            yield from top_synpreds(e)
+    elif isinstance(node, SubRule):
+        if node.suffix == '=>':
+            yield node
+        else:
+            yield from top_synpreds(node.block)
+    elif isinstance(node, Not):
+        yield from top_synpreds(node.elem)
 
 # Handlers for exceptions that cannot occur in <G>Parser.Parse:
 #  - TokenStreamRecognitionException: lexing finishes before parsing (TSqlParser.Parse), so the
@@ -221,6 +251,8 @@ class RuleConverter:
         self.synpred_index = 0
         self.rv = 0
         self.locals_decl = []
+        # a syntactic predicate's block (Converter.load_synpreds): no actions, nothing assigned
+        self.recognizer_only = rule.name in conv.synpred_blocks
 
     def aname(self, n):
         """Name of a parameter/return/label/local in the ANTLR rule context: ANTLR 4 rejects names
@@ -295,10 +327,8 @@ class RuleConverter:
             except Untranslatable:
                 pass
             return txt
-        if re.search(r'\bconsume\s*\(', text):
-            # ANTLR 2 actions may consume tokens; ANTLR 4's prediction would not see them
-            self.issues.append((aid, 'action consumes tokens (needs a grammar change)', sha(text)))
-            return 'G2TO4_UNTRANSLATED("%s %s: action consumes tokens");' % (self.r.name, aid)
+        # An action may consume tokens (offsetClause: FETCH APPROX[IMATE] NEXT). ANTLR 2's lookahead
+        # did not see them either, and the runtime decides as ANTLR 2 did (src/parser/ParserRuntime.cpp).
         try:
             out = self.tr.translate(text, self.scope, mode)
             self.actions_auto += 1
@@ -427,7 +457,7 @@ class RuleConverter:
                     except Untranslatable as ex:
                         self.issues.append((aid, str(ex), sha(e.args)))
                         args = '[G2TO4_UNTRANSLATED("%s")]' % ex
-            if e.assign:
+            if e.assign and not self.recognizer_only:
                 cret = parse_returns(callee.returns)
                 if not cret:
                     raise SystemExit('%s assigns from %s which returns nothing' % (self.r.name, e.name))
@@ -442,7 +472,7 @@ class RuleConverter:
                 # prediction sees the tokens it consumes
                 self.c.stats['action_rule_calls_to_refs'] += 1
                 lhs, rule, args = m.group(1), m.group(2), m.group(3).strip() or None
-                if '.' not in lhs:
+                if '.' not in lhs or self.recognizer_only:
                     return self.elem(RuleRef(rule, assign=lhs, args=args), depth)
                 ref = self.elem(RuleRef(rule, args=args), depth)
                 cret = parse_returns(self.c.P.rule_map[rule].returns)
@@ -451,6 +481,9 @@ class RuleConverter:
                 act = self.finish(self.snippet('a', '%s = G2TO4_RV;' % lhs, 'action'))
                 act = act.replace('G2TO4_RV', '$%s.%s' % (lab, RuleConverter(self.c, self.c.P.rule_map[rule]).aname(cret[1])))
                 return '%s=%s {%s}' % (lab, ref, act)
+            if self.recognizer_only:
+                # a syntactic predicate's block: ANTLR 2 runs it only while guessing, without actions
+                return ''
             txt = self.finish(self.snippet('a', e.text, 'action'))
             if self.r.name in self.c.guess_rules:
                 # ANTLR 2 skips actions while guessing (inside a syntactic predicate)
@@ -461,20 +494,22 @@ class RuleConverter:
         if isinstance(e, SubRule):
             if e.suffix == '=>':
                 self.synpred_index += 1
-                name = self.c.kept_synpred_name(self.r.name, self.synpred_index)
-                if name:
+                kept = self.c.kept_synpreds.get((self.r.name, self.synpred_index))
+                if kept:
                     # kept: a gated predicate that parses the ANTLR 2 lookahead speculatively
                     self.c.stats['synpreds_kept'] += 1
-                    return '{Speculate([this] { %s(); })}?' % name
+                    return '{Speculate(%s, [this] { %s(); })}?' % (rule_const(kept), kept)
                 self.synpreds_dropped += 1
                 self.c.stats['synpreds_dropped'] += 1
-                return ''
+                dropped = self.c.dropped_synpreds.get((self.r.name, self.synpred_index))
+                # nested in another syntactic predicate: left to ANTLR 4's lookahead
+                return synpred_marker(dropped) if dropped else ''
             pre = ''
             if e.block.init:
                 if GUESSING_INIT.match(e.block.init):
                     self.c.stats['guessing_inits_dropped'] += 1
                 else:
-                    pre = '{%s} ' % self.finish(self.snippet('a', e.block.init, 'action'))
+                    pre = '' if self.recognizer_only else '{%s} ' % self.finish(self.snippet('a', e.block.init, 'action'))
             suffix = e.suffix
             if e.block.options.get('greedy') == 'false':
                 if suffix in ('*', '+', '?'):
@@ -530,16 +565,21 @@ class Converter:
             self.rule_overrides[name] = text
         self.used_overrides = set()
         self.implicit_tokens = set()
-        self.load_kept_synpreds()
+        self.load_synpreds()
         self.stats = {k: 0 for k in ('synpreds_dropped', 'guessing_inits_dropped', 'nongreedy',
                                      'greedy_true_dropped', 'dropped_catch_clauses', 'action_rule_calls_to_refs',
                                      'synpreds_kept')}
 
-    def load_kept_synpreds(self):
-        """overrides/<G>/synpreds.txt: `rule N` keeps the N-th syntactic predicate of a rule (1-based)
-        as a speculative parse; all others are dropped and left to ANTLR 4's lookahead."""
-        self.kept_synpreds = {}       # (rule, n) -> synthetic rule name
-        self.synpred_blocks = {}      # synthetic rule name -> Block
+    def load_synpreds(self):
+        """Every syntactic predicate of a rule R (the N-th, 1-based, not nested in another) becomes
+        rule R_synpredN, which parses its block without actions (ANTLR 2 runs it only while
+        guessing, when actions are skipped). overrides/<G>/synpreds.txt `R N` keeps it as a gated
+        predicate, a speculative parse ANTLR 4 runs while predicting. Every other one is dropped
+        from ANTLR 4's view and left to its unbounded lookahead; its alternative starts with a
+        reference to the empty rule synpred_marker(R_synpredN), through which the runtime's
+        emulation of ANTLR 2's decisions (src/parser/ParserRuntime.cpp) runs the speculative parse
+        where ANTLR 2 would have (the generated parser's Antlr2SynPred)."""
+        kept = set()
         for path in (os.path.join(self.common_dir, 'synpreds.txt'), os.path.join(self.overrides_dir, 'synpreds.txt')):
             if not os.path.exists(path):
                 continue
@@ -548,12 +588,20 @@ class Converter:
                 if line:
                     rule, n = line.split()
                     if rule in self.P.rule_map:
-                        self.kept_synpreds[(rule, int(n))] = '%s_synpred%s' % (rule, n)
-        for (rule, n), name in self.kept_synpreds.items():
-            preds = [e for e in antlr2.walk(self.P.rule_map[rule].block) if isinstance(e, SubRule) and e.suffix == '=>']
-            if n > len(preds):
-                raise SystemExit('synpreds.txt: %s has no syntactic predicate %d' % (rule, n))
-            self.synpred_blocks[name] = preds[n - 1].block
+                        kept.add((rule, int(n)))
+        self.kept_synpreds = {}       # (rule, n) -> synthetic rule name
+        self.dropped_synpreds = {}    # (rule, n) -> synthetic rule name
+        self.synpred_blocks = {}      # synthetic rule name -> Block
+        self.synpred_owner = {}       # synthetic rule name -> the ANTLR 2 rule it is in
+        for r in self.P.rules:
+            for n, pred in enumerate(top_synpreds(r.block), 1):
+                name = '%s_synpred%d' % (r.name, n)
+                (self.kept_synpreds if (r.name, n) in kept else self.dropped_synpreds)[(r.name, n)] = name
+                self.synpred_blocks[name] = pred.block
+                self.synpred_owner[name] = r
+        missing = kept - set(self.kept_synpreds)
+        if missing:
+            raise SystemExit('synpreds.txt: no such syntactic predicate: %s' % sorted(missing))
         # rules that can run while guessing: their actions are skipped then
         work = [e.name for b in self.synpred_blocks.values() for e in antlr2.walk(b) if isinstance(e, RuleRef)]
         self.guess_rules = set(self.synpred_blocks)
@@ -563,8 +611,26 @@ class Converter:
                 self.guess_rules.add(n)
                 work.extend(e.name for e in antlr2.walk(self.P.rule_map[n].block) if isinstance(e, RuleRef))
 
-    def kept_synpred_name(self, rule, n):
-        return self.kept_synpreds.get((rule, n))
+    def synpred_dispatch(self):
+        """Named actions declaring and defining the generated parser's Antlr2SynPred(marker, ctx)
+        (TSql80ParserBase): the speculative parse of the dropped syntactic predicate whose marker
+        rule is `marker`, called with the arguments of its rule's context `ctx`."""
+        cases = []
+        for name in sorted(self.dropped_synpreds.values()):
+            owner = self.synpred_owner[name]
+            rc = RuleConverter(self, owner)
+            fields = ['c->' + ('p_' + p.name if p.mode == 'ptr' else rc.aname(p.name)) for p in parse_params(owner.args)]
+            marker = synpred_marker(name)
+            if fields:
+                call = ('if (auto* c = dynamic_cast<%sContext*>(ctx)) return Speculate(%s, [&] { %s(%s); });\n'
+                        '        return true;' % (owner.name[0].upper() + owner.name[1:], rule_const(name), name,
+                                                  ', '.join(fields)))
+            else:
+                call = 'return Speculate(%s, [this] { %s(); });' % (rule_const(name), name)
+            cases.append('    case %s:\n        %s' % (rule_const(marker), call))
+        return ('@parser::members {\nbool Antlr2SynPred(size_t marker, antlr4::ParserRuleContext* ctx) override;\n}\n',
+                '@parser::definitions {\nbool %s::Antlr2SynPred(size_t marker, [[maybe_unused]] antlr4::ParserRuleContext* ctx) {\n'
+                '    switch (marker) {\n%s\n    }\n    return true;\n}\n}\n' % (self.parser_name, '\n'.join(cases)))
 
     def parser_grammar(self):
         P = self.P
@@ -574,6 +640,7 @@ class Converter:
                'options { tokenVocab = %s; superClass = %sBase; }\n' % (self.lexer_name, self.parser_name),
                '@parser::header {\n#include "%sBase.h"\n}\n' % self.parser_name,
                '@parser::postinclude {\nusing namespace tsql::parser;\nnamespace ast = tsql::ast;\n}\n']
+        out.extend(self.synpred_dispatch())
         for r in P.rules:
             name = r.name
             rc = RuleConverter(self, r)
@@ -598,11 +665,17 @@ class Converter:
                            overridden=rc.overridden, issues=rc.issues)
             self.rule_reports[name] = rep
             out.append(text + '\n')
+        for (rule, n), name in sorted(self.dropped_synpreds.items()):
+            out.append('// Starts the alternative of %s, dropped syntactic predicate %d of %s (matches nothing)\n%s : ;\n'
+                       % (name, n, rule, synpred_marker(name)))
         for name in sorted(self.synpred_blocks):
+            owner = self.synpred_owner[name]
             r = antlr2.Rule()
             r.name, r.block = name, self.synpred_blocks[name]
-            out.append('// ANTLR 2 syntactic predicate, parsed speculatively (overrides/%s/synpreds.txt)\n%s\n'
-                       % (self.grammar, RuleConverter(self, r).convert()))
+            if name in self.dropped_synpreds.values():
+                r.args = owner.args   # Antlr2SynPred passes those of the rule's context
+            out.append('// ANTLR 2 syntactic predicate of %s, parsed speculatively\n%s\n'
+                       % (owner.name, RuleConverter(self, r).convert()))
         if self.implicit_tokens:
             out.insert(4, '// Implicitly defined by ANTLR 2 (not in TSqlTokenTypes.g; the lexer never produces them)\n'
                           'tokens { %s }\n' % ', '.join(sorted(self.implicit_tokens)))

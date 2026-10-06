@@ -32,6 +32,13 @@ CompletionResult Document::Complete(size_t caret, const Catalog& catalog) {
 
 std::vector<ColouredSpan> Document::Classify(size_t start, size_t end) { return ClassifyRange(impl_->buffer, start, end); }
 
+bool Document::ParseAhead(std::chrono::steady_clock::duration budget) {
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    const auto deadline = budget >= Clock::time_point::max() - now ? Clock::time_point::max() : now + budget;
+    return impl_->buffer.ParseAhead(deadline);
+}
+
 CompletionResult Complete(std::string_view sql, size_t caret, SqlVersion version, const Catalog& catalog) {
     Document d(version);
     d.SetText(sql);

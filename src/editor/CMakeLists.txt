@@ -5,7 +5,7 @@ set(TSQL_EDITOR_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 set(parser_bin ${PROJECT_BINARY_DIR}/src/parser)
 set(parser_gen ${parser_bin}/generated)
 set(editor_meta_py ${TSQL_EDITOR_ROOT}/tools/g2to4/editor_meta.py)
-file(GLOB parser_base_sources ${TSQL_EDITOR_ROOT}/src/parser/*.cpp ${TSQL_EDITOR_ROOT}/src/parser/*.h
+file(GLOB parser_base_sources CONFIGURE_DEPENDS ${TSQL_EDITOR_ROOT}/src/parser/*.cpp ${TSQL_EDITOR_ROOT}/src/parser/*.h
     ${TSQL_EDITOR_ROOT}/src/parser/helpers/*)
 
 # SqlVersionFlags bit of each grammar's version (SqlScriptDOM SqlVersionFlags)
@@ -29,8 +29,9 @@ foreach(g IN LISTS TSQL_PARSER_GRAMMARS)
         OUTPUT ${meta}
         COMMAND ${Python3_EXECUTABLE} -B ${editor_meta_py} --grammar ${g} --parser-dir ${parser_gen}/${g}
             --support ${parser_gen}/support --base-dir ${TSQL_EDITOR_ROOT}/src/parser --out ${meta}
-        DEPENDS ${editor_meta_py} ${parser_sources} ${parser_gen}/support/CodeGenerationSupporter.h
-            ${parser_gen}/support/OptionHelpers.h ${parser_gen}/support/ParserEnums.h ${parser_base_sources}
+        DEPENDS ${editor_meta_py} ${parser_sources} ${parser_gen}/${g}/grammar/${g}Parser.g4
+            ${parser_gen}/support/CodeGenerationSupporter.h ${parser_gen}/support/OptionHelpers.h
+            ${parser_gen}/support/ParserEnums.h ${parser_base_sources}
         COMMENT "editor_meta: keyword metadata of ${g}"
         VERBATIM)
     list(APPEND editor_meta_files ${meta})

@@ -16,15 +16,14 @@ using TK = ast::TSqlTokenType;
 }  // namespace
 
 bool TSql130ParserBase::NextIdentifierMatchesOneOf(const std::vector<std::string>& keywords) {
-    std::string text;
     if (LA(1) == TT(TK::Identifier)) {
-        text = LT(1)->getText();
-    } else if (LA(1) == TT(TK::QuotedIdentifier)) {
-        ast::QuoteType quote;
-        text = ast::Identifier::DecodeIdentifier(LT(1)->getText(), quote);
-    } else {
+        for (const auto& keyword : keywords)
+            if (TextMatches(LT(1), keyword)) return true;
         return false;
     }
+    if (LA(1) != TT(TK::QuotedIdentifier)) return false;
+    ast::QuoteType quote;
+    const std::string text = ast::Identifier::DecodeIdentifier(LT(1)->getText(), quote);
     for (const auto& keyword : keywords)
         if (EqualsIgnoreCase(keyword, text)) return true;
     return false;

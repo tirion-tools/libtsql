@@ -3,6 +3,7 @@
 // tsql_editor.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -117,6 +118,13 @@ public:
     /// The spans of the tokens overlapping [start, end), contiguous; the first may begin before
     /// `start` and the last end after `end`. Cost grows with the range, not the document.
     std::vector<ColouredSpan> Classify(size_t start, size_t end);
+
+    /// Parses the text the queries have not needed yet, from the start, for about `budget`: it
+    /// stops at the first statement boundary after the budget runs out, so one call can overrun by
+    /// one statement's parse. Returns true once everything is parsed (until the next edit or
+    /// SetText). Meant for the editor's idle time after opening or a large paste, so that a later
+    /// Complete or Classify anywhere is fast; no other result depends on it.
+    bool ParseAhead(std::chrono::steady_clock::duration budget);
 
 private:
     struct Impl;

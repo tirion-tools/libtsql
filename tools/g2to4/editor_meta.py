@@ -13,7 +13,14 @@ call, so N is the ATN state of the element) and from the hand-written parser bas
     them (Match, ParseOption, a base function that throws otherwise) or only recognises them
     (TryMatch, TryParseOption, IsX, ParseDataType's user-defined-type fallback);
   - predicates: predicate index -> its condition as a small expression over NextTokenMatches,
-    LA(k) == Token and opaque calls.
+    LA(k) == Token and opaque calls;
+  - rule actions: per rule, how many actions it has and which of them can reject the input in a
+    way the walk does not model (they throw a parse error or return from the rule early, other
+    than the keyword check of the token right before them), read from the grammar (.g4) in text
+    order, which is the order of their ATN states; and the actions that return from their rule
+    when a condition the walk can evaluate holds (`if (NextTokenMatches(X)) return`), with it;
+  - predicted decisions: the decisions the generated code predicts with adaptivePredict, where
+    the runtime's emulation of ANTLR 2's decisions applies (the walk applies it there too).
 
 Usage: editor_meta.py --grammar TSql170 --parser-dir <generated/TSql170> --support <generated/support>
                       --base-dir src/parser --out <file.inc>
@@ -349,8 +356,8 @@ class PredParser:
             # name is the token two before the alternatives
             if re.fullmatch(r'_localctx->vResult->FunctionName != nullptr', a):
                 return 'T'
-            m = re.fullmatch(r'Str_ToUpper\(_localctx->vResult->FunctionName->Value, CultureInfo::InvariantCulture\) == '
-                             r'CodeGenerationSupporter::(\w+)', a)
+            m = re.fullmatch(r'Str_UpperEquals\(_localctx->vResult->FunctionName->Value, '
+                             r'CodeGenerationSupporter::(\w+)\)', a)
             if m and m.group(1) in self.consts:
                 return 'b2:%s;' % self.consts[m.group(1)].upper()
         m = re.fullmatch(r'NextTokenMatches\(\(?CodeGenerationSupporter::(\w+)\)?(?:,\s*(\d+))?\)', a)
@@ -432,11 +439,12 @@ def keyword_states(text, consts, helpers, funcs, idfuncs):
 
         def element_before(pos):
             """The token match whose action runs the call at `pos` unconditionally (no other element,
-            decision, if / else / switch / ?: or open brace between)."""
+            decision, if / else / switch / ?: or open brace between; outside a speculative parse, an
+            action of a rule one runs is in `if (!Guessing()) {`, convert.py)."""
             prior = [(e, s) for e, s in elements if e <= pos]
             if not prior:
                 return None
-            between = body[prior[-1][0]:pos]
+            between = re.sub(r'^\s*if \(!Guessing\(\)\) \{', '', body[prior[-1][0]:pos])
             if re.search(r'setState\(|\bif\b|\belse\b|\bswitch\b|\bcase\b|\?|\{|\}', between):
                 return None
             return prior[-1][1]
@@ -501,6 +509,170 @@ def keyword_states(text, consts, helpers, funcs, idfuncs):
     return states, guards
 
 
+# --------------------------------------------------------------------------- rejecting actions
+
+# a throw that rejects the input (not the argument checks ported from C#)
+THROW = re.compile(r'\bthrow\b(?!\s+(?:NullReferenceException|std::invalid_argument)\b)')
+# the keyword checks of a token the walk applies itself (keyword states)
+OWN_CHECKS = {'Match', 'TryMatch', 'ParseOption', 'TryParseOption'}
+
+
+def skip_code(text, i):
+    """If text[i] starts a comment, string or character literal, the index just past it, else i."""
+    if text.startswith('//', i):
+        end = text.find('\n', i)
+        return len(text) if end < 0 else end
+    if text.startswith('/*', i):
+        end = text.find('*/', i + 2)
+        return len(text) if end < 0 else end + 2
+    if text[i] in '"\'':
+        q, j = text[i], i + 1
+        while j < len(text) and text[j] != q:
+            j += 2 if text[j] == '\\' else 1
+        return j + 1
+    return i
+
+
+def code_group(text, start, open_ch, close_ch):
+    """Index just past the bracket group starting at text[start] == open_ch, skipping comments and
+    literals (an apostrophe in a comment is not a character literal)."""
+    depth, i = 0, start
+    while i < len(text):
+        j = skip_code(text, i)
+        if j != i:
+            i = j
+            continue
+        if text[i] == open_ch:
+            depth += 1
+        elif text[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def strip_code(text):
+    """`text` without comments and literals."""
+    out, i = [], 0
+    while i < len(text):
+        j = skip_code(text, i)
+        if j != i:
+            out.append(' ')
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return ''.join(out)
+
+
+def load_throwing_functions(base_dir):
+    """Names of the hand-written parser-base functions that can reject the input: their body, or a
+    function they call, throws a parse error."""
+    bodies = {}
+    files = glob.glob(os.path.join(base_dir, '*.cpp')) + glob.glob(os.path.join(base_dir, '*.h'))
+    files += glob.glob(os.path.join(base_dir, 'helpers', '*'))
+    for path in sorted(files):
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        for m in FUNC_HEAD.finditer(text):
+            if m.group(1) in ('if', 'while', 'for', 'switch', 'catch', 'return'):
+                continue
+            bodies.setdefault(m.group(1), []).append(strip_code(text[m.end() - 1:balanced(text, m.end() - 1)]))
+    throwing = {n for n, bs in bodies.items() if any(THROW.search(b) for b in bs)}
+    changed = True
+    while changed:
+        changed = False
+        for n, bs in bodies.items():
+            if n not in throwing and any(set(re.findall(r'\b(\w+)\(', b)) & throwing for b in bs):
+                throwing.add(n)
+                changed = True
+    return throwing
+
+
+def grammar_actions(g4):
+    """Rule name -> [(action code, label of the token matched right before it or None)], the
+    rule's actions ({...} but not predicates {...}?) in text order, which is the order of their
+    ATN states (the ATN builder numbers elements and actions as it meets them)."""
+    rules = {}
+    heads = [(m.start(), m.group(1)) for m in re.finditer(r'^([a-z]\w*)\b', g4, re.M)
+             if m.group(1) not in ('locals', 'returns', 'options', 'throws', 'parser', 'tokens', 'import')]
+    heads.append((len(g4), None))
+    for (a, name), (b, _) in zip(heads, heads[1:]):
+        body = g4[a:b]
+        i, colon = 0, None
+        while i < len(body) and colon is None:   # the header: [args] returns [...] locals [...] @init {...}
+            c = body[i]
+            if c == '[':
+                i = code_group(body, i, '[', ']')
+            elif c == '{':
+                i = code_group(body, i, '{', '}')
+            elif c == ':':
+                colon = i
+            else:
+                i += 1
+        if colon is None:
+            continue
+        actions, i = [], colon + 1
+        while i < len(body):
+            j = skip_code(body, i)
+            if j != i:
+                i = j
+            elif body[i] == '[':
+                i = code_group(body, i, '[', ']')
+            elif body[i] == '{':
+                end = code_group(body, i, '{', '}')
+                if not body.startswith('?', end):
+                    lm = re.search(r'\b(\w+)=([A-Z]\w*)\s*$', body[:i])
+                    actions.append((body[i:end], lm.group(1) if lm else None))
+                i = end
+            else:
+                i += 1
+        rules[name] = actions
+    return rules
+
+
+# an action of a rule a syntactic predicate's speculative parse runs (convert.py): it runs outside
+# the speculation only, where the walk always is
+GUESSING_GUARD = re.compile(r'\s*\{\s*if\s*\(\s*!\s*Guessing\(\)\s*\)\s*(\{.*\})\s*\}\s*', re.S)
+
+
+def return_condition(action, consts):
+    """The condition of an action that only returns from its rule when it holds
+    (`if (C) { return _localctx; }`), as a predicate expression (PredParser); else None."""
+    code = strip_code(action)
+    guarded = GUESSING_GUARD.fullmatch(code)
+    if guarded:
+        code = guarded.group(1)
+    m = re.fullmatch(r'\s*\{\s*if\s*\((.*)\)\s*\{?\s*return\s+_localctx\s*;\s*\}?\s*\}\s*', code, re.S)
+    return PredParser(' '.join(m.group(1).split()), consts).parse_or() if m else None
+
+
+def rejecting(action, own, throwing, funcs):
+    """Whether an action can reject the input in a way the walk does not model: it throws or
+    returns from the rule, or calls a function that can throw, other than the keyword checks of
+    `own` (the token matched right before it, which keyword states model)."""
+    code = strip_code(action)
+    # lambdas' bodies: their return statements do not leave the rule
+    while True:
+        m = re.search(r'\[[&=]?\]\s*\([^()]*\)\s*(?:->\s*[\w:<>*&\s]+?)?\s*\{', code)
+        if not m:
+            break
+        code = code[:m.start()] + ' ' + code[balanced(code, m.end() - 1):]
+    if re.search(r'\bthrow\b|\breturn\b', code):
+        return True
+    for cm in re.finditer(r'(?<![\w>:])(\w+)\(', code):
+        fn = cm.group(1)
+        if fn not in throwing:
+            continue
+        args, _ = call_args(code, cm.end() - 1)
+        if own is not None and args and re.fullmatch(r'\$?%s' % own, args[0].strip()) and \
+                (fn in OWN_CHECKS or fn in funcs):
+            continue
+        return True
+    return False
+
+
 # ------------------------------------------------------------------------------------- output
 
 
@@ -539,10 +711,34 @@ def main():
             entry = guards.setdefault(key, {})
             for w, f in words.items():
                 entry[w] = entry.get(w, 0) | f
+    throwing = load_throwing_functions(a.base_dir)
+    with open(os.path.join(a.parser_dir, 'grammar', a.grammar + 'Parser.g4'), encoding='utf-8') as f:
+        actions = grammar_actions(f.read())
+    rule_actions, returning = {}, []
+    for rule, acts in actions.items():
+        if not acts:
+            continue
+        rejects = []
+        for k, (code, own) in enumerate(acts):
+            cond = return_condition(code, consts)
+            if cond is not None and '?' not in cond and '$' not in cond:
+                returning.append((rule, k, cond))   # the walk takes both ways by the condition
+            elif rejecting(code, own, throwing, funcs):
+                rejects.append(k)
+        rule_actions[rule] = (len(acts), rejects)
+
+    # the decisions the generated code predicts with adaptivePredict (the others it decides with
+    # LA(1) inline), where the runtime applies ANTLR 2's tests
+    predicted = set()
+    for text in sources:
+        predicted.update(int(d) for d in re.findall(r'adaptivePredict\(_input, (\d+), _ctx\)', text))
 
     lines = ['// GENERATED by tools/g2to4/editor_meta.py from the %s parser. Do not edit.' % a.grammar,
              '// Keyword states: {ATN state, word, SqlVersionFlags mask, binding}; guards: {ATN state, guard',
-             '// state, word, mask}; predicates: {index, expression}.',
+             '// state, word, mask}; predicates: {index, expression}; rule actions: {rule, number of',
+             '// actions, ordinals of those that can reject the input}; returning actions: {rule, ordinal,',
+             '// condition under which it returns from the rule}; predicted decisions: the decisions the',
+             '// generated code predicts with adaptivePredict.',
              'static const ::tsql::editor::detail::KeywordStateEntry kKeywordStates[] = {']
     for st in sorted(states):
         words, binding = states[st]
@@ -560,13 +756,30 @@ def main():
     for i in sorted(preds):
         lines.append('    {%d, %s},' % (i, cstr(preds[i])))
     lines.append('};')
+    lines.append('static const ::tsql::editor::detail::RuleActionsEntry kRuleActions[] = {')
+    for rule in sorted(rule_actions):
+        count, rejects = rule_actions[rule]
+        lines.append('    {%s, %d, %s},' % (cstr(rule), count, cstr(' '.join(str(k) for k in rejects))))
+    lines.append('    {nullptr, 0, nullptr},   // end')
+    lines.append('};')
+    lines.append('static const ::tsql::editor::detail::ReturningActionEntry kReturningActions[] = {')
+    for rule, k, cond in sorted(returning):
+        lines.append('    {%s, %d, %s},' % (cstr(rule), k, cstr(cond)))
+    lines.append('    {nullptr, 0, nullptr},   // end')
+    lines.append('};')
+    lines.append('static const int kPredictedDecisions[] = {')
+    for d in sorted(predicted):
+        lines.append('    %d,' % d)
+    lines.append('    -1,   // end')
+    lines.append('};')
     out = '\n'.join(lines) + '\n'
     if not os.path.exists(a.out) or open(a.out, encoding='utf-8').read() != out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         with open(a.out, 'w', encoding='utf-8') as f:
             f.write(out)
-    print('%s: %d keyword states, %d guards, %d predicates (%d opaque)' % (
-        a.grammar, len(states), len(guards), len(preds), sum(1 for p in preds.values() if '?' in p or '$' in p)),
+    print('%s: %d keyword states, %d guards, %d predicates (%d opaque), %d of %d actions can reject' % (
+        a.grammar, len(states), len(guards), len(preds), sum(1 for p in preds.values() if '?' in p or '$' in p),
+        sum(len(r) for _, r in rule_actions.values()), sum(c for c, _ in rule_actions.values())),
         file=sys.stderr)
 
 

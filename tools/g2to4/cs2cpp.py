@@ -1009,6 +1009,15 @@ class _State:
             if call:
                 a, j = self.args(i, b)
                 inner = a[1:-1]
+                if name in ('ToUpper', 'ToUpperInvariant') and self.tx(j) in ('==', '!='):
+                    # s.ToUpper[Invariant](...) == t: compared without building the upper-case copy
+                    try:
+                        right, rk, k = self.chain(j + 1, b)
+                    except Untranslatable:
+                        rk = None
+                    if rk in ('str', 'cstr') and (k >= b or self.tx(k) in (')', '&&', '||', ';', ',', '?', ':')):
+                        return '%sStr_UpperEquals(%s, %s)' % ('!' if self.tx(j) == '!=' else '', text, right.strip()), \
+                            'bool', k
                 return 'Str_%s(%s%s)' % (name, text, (', ' + inner) if inner else ''), \
                     STRING_METHOD_KIND.get(name, 'unknown'), j
             raise Untranslatable('string member ' + name)

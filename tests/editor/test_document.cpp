@@ -23,6 +23,11 @@ using namespace editor_contract;
 // Deterministic randomized edit sequences (fixed seeds, own RNG arithmetic so every platform replays the same
 // edits) over realistic scripts compare Document::Complete at several carets and Document::Classify over the whole
 // text and over ranges with Complete/Classify on the edited text, after every edit.
+// ParseAhead calls with random budgets (zero, tiny, a few ms, an hour) are interleaved; no timing is asserted, only
+// that results stay equal and what the contract states: a huge budget finishes in one call; zero-budget calls on
+// unchanged text finish within (bytes + 2) calls (each may parse one statement); once true, ParseAhead stays true
+// across queries until the next Edit or SetText; right after SetText replaces the text with a many-statement script,
+// ParseAhead(0) cannot finish. Nothing exact is asserted after an Edit (it may parse eagerly or not).
 
 const char* const kScriptTuning = R"SQL(/* Performance triage: top queries, waits, missing indexes.
    Run on the instance under test; Umsätze report at the end. */
@@ -146,6 +151,9 @@ const char* const kTyped[] = {
     "\nGO\n", "SELECT o.", "SELECT * FROM sys.", "/* note */", "'it''s'", "-- todo\n", "WHERE ", "N'Umsätze'",
     "BEGIN\n", "END\n", "EXEC dbo.usp_GetOrders @", "JOIN dbo.Customers c ON c.",
 };
+
+// A budget no parse of these scripts can exhaust: ParseAhead must finish in one call.
+constexpr std::chrono::steady_clock::duration kHugeBudget = std::chrono::hours(1);
 
 // Deterministic on every platform (std::uniform_int_distribution is not).
 class Rng {
@@ -282,8 +290,19 @@ private:
 
     void SetText(const std::string& text, std::string what) {
         Record(std::move(what));
+        bool changed = text != text_;
         text_ = text;
         doc_.SetText(text);
+        done_ = false;
+        // Nothing has been queried since SetText replaced the text and every base script has many statements, so a
+        // zero budget (which may parse one statement) cannot finish.
+        if (changed && rng_.chance(40)) {
+            Record("ParseAhead(0) right after SetText");
+            if (doc_.ParseAhead(std::chrono::steady_clock::duration::zero()))
+                Fail("ParseAhead(0) returned true right after SetText of a script with many statements");
+        }
+        if (rng_.chance(35)) Drain();  // opening a file: idle-time parse before the first query
+        else if (rng_.chance(30)) ParseAheadRandom();
         Check(rng_.below(text_.size() + 1), true);
     }
 
@@ -292,7 +311,56 @@ private:
         Record(what + " at " + std::to_string(start) + " len " + std::to_string(length) + " -> " + Quote(replacement));
         text_.replace(start, length, replacement);
         doc_.Edit(start, length, replacement);
+        done_ = false;  // after any edit only rules 1 and 2 and result equality apply
+        if (rng_.chance(25)) ParseAheadRandom();
         if (!deferCheck_) Check(start + replacement.size(), full);
+    }
+
+    // ParseAhead with `budget`: a huge budget finishes in one call; once it has returned true it keeps returning
+    // true until the next Edit or SetText, whatever queries come in between. Returns its result.
+    bool ParseAhead(std::chrono::steady_clock::duration budget, const char* name) {
+        if (failed_) return false;
+        Record(std::string("ParseAhead(") + name + ")");
+        bool finished = doc_.ParseAhead(budget);
+        if (!finished && budget >= kHugeBudget) Fail(std::string("ParseAhead(") + name + ") returned false");
+        if (!finished && done_) Fail(std::string("ParseAhead(") + name + ") returned false after an earlier call returned true, with no edit since");
+        done_ = done_ || finished;
+        return finished;
+    }
+
+    bool ParseAheadRandom() {
+        static const std::pair<std::chrono::steady_clock::duration, const char*> kBudgets[] = {
+            {std::chrono::steady_clock::duration::zero(), "0"},
+            {std::chrono::nanoseconds(1), "1 ns"},
+            {std::chrono::microseconds(20), "20 us"},
+            {std::chrono::microseconds(200), "200 us"},
+            {std::chrono::milliseconds(2), "2 ms"},
+            {kHugeBudget, "1 h"},
+        };
+        const auto& [budget, name] = kBudgets[rng_.below(std::size(kBudgets))];
+        return ParseAhead(budget, name);
+    }
+
+    // Parses ahead until done: in one call with a huge budget, or by zero-budget calls, each of which makes
+    // progress (it may parse one statement), so the text's byte count + 2 calls are always enough.
+    void Drain() {
+        if (rng_.chance(50)) {
+            ParseAhead(kHugeBudget, "1 h");
+            return;
+        }
+        size_t limit = text_.size() + 2, calls = 0;
+        Record("ParseAhead(0) until it returns true");
+        while (!failed_ && !doc_.ParseAhead(std::chrono::steady_clock::duration::zero()))
+            if (++calls > limit) Fail("ParseAhead(0) still returned false after " + std::to_string(limit) + " calls on unchanged text");
+        done_ = !failed_;
+    }
+
+    void Fail(const std::string& issue) {
+        if (failed_) return;
+        failed_ = true;
+        std::printf("FAIL document %s seed %llu after:\n", name_.c_str(), static_cast<unsigned long long>(seed_));
+        for (const auto& h : history_) std::printf("    %s\n", h.c_str());
+        std::printf("  - %s\n  text: %zu bytes\n", issue.c_str(), text_.size());
     }
 
     // Keeps the last actions for a failure report; --verbose also prints each one as it happens (for crashes).
@@ -303,6 +371,12 @@ private:
     }
 
     void Macro() {
+        if (rng_.chance(10)) {
+            // Idle time: parse everything, then query (Check's ParseAhead must still return true).
+            Drain();
+            Check(Pos(), rng_.chance(50));
+            return;
+        }
         size_t base = bases_[0].size();
         if (text_.size() > base * 2 + 256) {
             auto [start, length] = Range(text_.size() / 3);
@@ -436,6 +510,8 @@ private:
                 if (!diff.empty()) issues.push_back("Complete(" + std::to_string(caret) + "): " + diff);
                 CheckCompletionInvariants(text_, caret, got, issues);
             }
+            // Queries do not undo a finished ParseAhead (checked inside ParseAhead when done_ is set).
+            if (done_ || rng_.chance(15)) ParseAheadRandom();
         } catch (const std::exception& e) {
             issues.push_back(std::string("threw: ") + e.what());
         }
@@ -459,6 +535,7 @@ private:
     std::vector<std::string> history_;
     size_t step_ = 0, checks_ = 0;
     bool failed_ = false, verbose_ = false, deferCheck_ = false;
+    bool done_ = false;  // a ParseAhead returned true and there has been no Edit or SetText since
 };
 
 // Contract points that are not edit sequences. Returns the number of failures.
@@ -480,6 +557,7 @@ size_t RunDocumentBasics(SqlVersion version, const Catalog& catalog) {
     // A new Document is empty.
     if (!doc.Text().empty()) issues.push_back("a new Document's Text() is not empty");
     if (!doc.Classify(0, 0).empty()) issues.push_back("Classify(0, 0) of an empty Document returned spans");
+    if (!doc.ParseAhead(kHugeBudget)) issues.push_back("ParseAhead(1 h) of an empty Document returned false");
     {
         std::string diff = CompletionDiff(doc.Complete(0, catalog), Complete("", 0, version, catalog));
         if (!diff.empty()) issues.push_back("Complete(0) of an empty Document: " + diff);
@@ -508,6 +586,29 @@ size_t RunDocumentBasics(SqlVersion version, const Catalog& catalog) {
         expected.erase(caret, 1);
         std::string diff = CompletionDiff(doc.Complete(caret, catalog), Complete(expected, caret, version, catalog));
         if (!diff.empty()) issues.push_back("Complete after SetText+Edit: " + diff);
+    }
+    // ParseAhead after SetText: a zero budget (at most one statement) cannot finish a many-statement script, zero-budget
+    // calls finish within bytes + 2 calls, and queries leave it finished.
+    for (const char* script : {kScriptTuning, kScriptProcedure}) {
+        std::string s = script;
+        std::string name = s.substr(0, 30);
+        doc.SetText(s);
+        if (doc.ParseAhead(std::chrono::steady_clock::duration::zero()))
+            issues.push_back("ParseAhead(0) right after SetText of " + Quote(name) + "... returned true");
+        size_t calls = 1;
+        while (!doc.ParseAhead(std::chrono::steady_clock::duration::zero()) && calls <= s.size() + 2) ++calls;
+        if (calls > s.size() + 2) {
+            issues.push_back("ParseAhead(0) on " + Quote(name) + "... did not finish within " + std::to_string(s.size() + 2) + " calls");
+            continue;
+        }
+        std::string diff = SpanDiff(s, doc.Classify(0, s.size()), Classify(s, version));
+        if (!diff.empty()) issues.push_back("Classify after ParseAhead finished on " + Quote(name) + "...: " + diff);
+        diff = CompletionDiff(doc.Complete(s.size() / 2, catalog), Complete(s, s.size() / 2, version, catalog));
+        if (!diff.empty()) issues.push_back("Complete after ParseAhead finished on " + Quote(name) + "...: " + diff);
+        if (!doc.ParseAhead(std::chrono::steady_clock::duration::zero()))
+            issues.push_back("ParseAhead(0) returned false after queries on finished, unchanged " + Quote(name) + "...");
+        doc.Edit(s.size() / 3, 0, "\nGO\n");
+        if (!doc.ParseAhead(kHugeBudget)) issues.push_back("ParseAhead(1 h) after an edit returned false");
     }
     for (const auto& i : issues) std::printf("FAIL document basics: %s\n", i.c_str());
     return issues.size();

@@ -20,7 +20,8 @@
 #   pilot-dumps   NuGet oracle over heldout, bigdir, bigerr, probes, mut
 #   oracle-<V>    source oracle --parser V over ssd/Test/SqlDom + classify, for each version V
 #   heldout-<V>   tools/diff/mk_heldout_all.py --version V (lists, heldout-V, hoa-V-oracle)
-#   crashes       tools/diff/mk_crashes.sh (former tsql_dump crashes) -> crashes/, crashes-list.txt
+#   crashes       tools/diff/mk_crashes.sh (former tsql_dump crashes and runaways, inline-decision
+#                 probes) -> crashes/, crashes-list.txt
 #   crash-<V>     source oracle --parser V over crashes -> crash-o-<V>
 # Builds hold $P/build.lock (shared with tools/diff/check.sh and the CMake build helper)
 # and every heavy step runs in the memory-capped slice when $P/bin/capped exists.

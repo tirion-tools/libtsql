@@ -14,12 +14,13 @@ template <class Lexer, class Parser>
 class GrammarImpl final : public Grammar {
 public:
     GrammarImpl(SqlVersion v, int flag, const KeywordStateEntry* states, size_t nStates, const KeywordGuardEntry* guards,
-                const PredicateEntry* preds, size_t nPreds) {
+                const PredicateEntry* preds, size_t nPreds, const RuleActionsEntry* actions,
+                const ReturningActionEntry* returning, const int* predicted) {
         antlr4::ANTLRInputStream input("");
         Lexer lexer(&input);
         antlr4::CommonTokenStream tokens(&lexer);
         Parser parser(&tokens);
-        Init(v, flag, parser, states, nStates, guards, preds, nPreds);
+        Init(v, flag, parser, states, nStates, guards, preds, nPreds, actions, returning, predicted);
     }
 
     void LexFrom(std::string_view text, size_t start, bool goAcceptable,
@@ -87,7 +88,7 @@ public:
         ParseSession session(*this, view, from.token, view.tokens->size());
         session.SetObserver(&observer);
         SessionParser parser(&session.ParserStream(), session, *this);
-        session.Attach(parser, parser);
+        parser.Attach();
         tsql::detail::TokensGuard guard(&session.Script());
         try {
             parser.Resume(from, [] {});
@@ -105,7 +106,29 @@ public:
         return caret;
     }
 
+    Trial TryParse(const TokenSourceView& view) const override {
+        // the checks of choices that looked at the end matter only to a parse that fails after one:
+        // such a parse runs again with them
+        if (std::optional<Trial> t = RunTrial(view, false)) return *t;
+        return *RunTrial(view, true);
+    }
+
 private:
+    std::optional<Trial> RunTrial(const TokenSourceView& view, bool checkChoices) const {
+        ParseSession session(*this, view, 0, view.tokens->size());
+        session.SetTrial(checkChoices);
+        SessionParser parser(&session.ParserStream(), session, *this);
+        parser.Attach();
+        tsql::detail::TokensGuard guard(&session.Script());
+        try {
+            parser.Resume(ResumePoint{}, [&] { session.Stream().armed = &parser; });
+        } catch (...) {
+            // reached the end (CaptureDone), or an error escaped every recovering rule
+        }
+        session.Stream().armed = nullptr;
+        return session.TrialOutcome();
+    }
+
     /// The lexer's input: remembers the furthest character the lexer looked at.
     class WindowInput final : public antlr4::ANTLRInputStream {
     public:
@@ -138,6 +161,16 @@ private:
 
         bool QuotedIdentifier() const override { return this->_quotedIdentifier; }
 
+        /// Sets the parser up for its session (ParseSession::Attach) with the session's simulator:
+        /// a TrialSimulator in trial runs (same ATN, DFA cache and prediction mode).
+        void Attach() {
+            session_.Attach(*this, *this);
+            auto* base = this->template getInterpreter<antlr4::atn::ParserATNSimulator>();
+            this->UseSimulator(session_.TrialRun()
+                                   ? new TrialSimulator(this, *base, session_.Stream(), session_)
+                                   : new SessionSimulator(this, *base));
+        }
+
         antlr4::Token* consume() override {
             if (session_.Recording()) session_.OnConsume(*this);
             return Parser::consume();
@@ -153,6 +186,23 @@ private:
             const bool result = Parser::sempred(ctx, ruleIndex, predicateIndex);
             if (session_.Recording()) session_.OnPredicate(*this, predicateIndex, result);
             return result;
+        }
+
+        /// The speculative parse of a syntactic predicate ANTLR 2's decision emulation runs: an
+        /// opaque predicate; when it looked at the caret, the parser captures at its decision.
+        bool Antlr2SynPred(size_t marker, antlr4::ParserRuleContext* ctx) override {
+            bool matched;
+            {
+                struct Current {
+                    ParseSession& s;
+                    ~Current() { s.LeavePredicate(ParseSession::kSyntacticPredicate); }
+                } current{session_};
+                session_.EnterPredicate(*this, ParseSession::kSyntacticPredicate);
+                matched = Parser::Antlr2SynPred(marker, ctx);
+            }
+            // (after the speculation has restored the parser: the decision's state and context)
+            if (session_.TakeSpeculationAtCaret()) session_.Stream().CaptureHere();
+            return matched;
         }
 
         void enterRule(antlr4::ParserRuleContext* localctx, size_t state, size_t ruleIndex) override {
@@ -275,7 +325,7 @@ private:
         Caret(const GrammarImpl& g, const TokenSourceView& view, size_t begin, size_t limit)
             : g_(g), session_(g, view, begin, limit), parser_(&session_.ParserStream(), session_, g) {
             session_.PrepareCaretTokens();
-            session_.Attach(parser_, parser_);
+            parser_.Attach();
         }
 
         void Run(const ResumePoint& from) {
@@ -290,9 +340,10 @@ private:
             result = std::move(session_.Result());
         }
 
-        int EvaluatePredicate(size_t ruleIndex, size_t predIndex, size_t index, const Capture* locals) override {
+        int EvaluatePredicate(size_t ruleIndex, size_t predIndex, size_t index, const Capture* locals,
+                              const ProbeToken* probe) override {
             auto it = g_.predicates.find(predIndex);
-            if (it == g_.predicates.end()) return -1;
+            if (it == g_.predicates.end()) return kUnknown;
             // a predicate that reads rule locals runs only in the captured context (the walk runs
             // no actions, so elsewhere its locals are not what the parse would have set)
             antlr4::ParserRuleContext unused;   // a predicate of the tokens does not read its context
@@ -300,21 +351,35 @@ private:
             if (it->second.find('?') != std::string::npos) {
                 if (locals == nullptr || locals->context == nullptr || locals->index != index ||
                     locals->context->getRuleIndex() != ruleIndex)
-                    return -1;
+                    return kUnknown;
                 context = static_cast<antlr4::ParserRuleContext*>(locals->context);
             }
+            CaptureStream& stream = session_.Stream();
+            if (probe != nullptr) {
+                // the caret is where the stream's EOF stands
+                if (stream.size() == 0 || stream.get(stream.size() - 1)->getType() != antlr4::Token::EOF ||
+                    index >= stream.size())
+                    return kUnknown;
+                stream.Probe(probe->type, std::string(probe->text));
+            }
             tsql::detail::TokensGuard guard(&session_.Script());
-            session_.Stream().armed = nullptr;
-            session_.Stream().seek(index);
+            stream.armed = nullptr;
+            stream.seek(index);
             session_.BeginEvaluation();
             int value;
             try {
-                value = parser_.sempred(context, ruleIndex, predIndex) ? 1 : 0;
+                value = parser_.sempred(context, ruleIndex, predIndex) ? kTrue : kFalse;
             } catch (...) {
-                value = -1;
+                value = kUnknown;
             }
-            if (session_.EndEvaluation()) value = -1;   // it read the caret: undecided
+            // it read the caret (without a probe: it needs that token), or past the probe
+            if (session_.EndEvaluation() && value != kUnknown) value = probe != nullptr ? kUnknown : kReadsCaret;
+            if (probe != nullptr) stream.Unprobe();
             return value;
+        }
+
+        parser::TSqlParserATNSimulator& Simulator() override {
+            return *parser_.template getInterpreter<parser::TSqlParserATNSimulator>();
         }
 
     private:

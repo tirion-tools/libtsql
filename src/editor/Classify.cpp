@@ -92,7 +92,8 @@ std::vector<ColouredSpan> ClassifyRange(Buffer& buffer, size_t start, size_t end
     std::vector<ColouredSpan> spans;
     end = std::min(end, sql.size());
     if (start >= end) return spans;
-    const std::vector<LexToken>& toks = buffer.Tokens();
+    buffer.LexTo(end);   // up to a parser-visible token starting at or after `end`
+    const std::vector<LexToken>& toks = buffer.Lexed();
     // tokens [first, last) overlap the range (ends and starts are increasing)
     const size_t first = static_cast<size_t>(
         std::upper_bound(toks.begin(), toks.end(), start, [](size_t s, const LexToken& t) { return s < t.end; }) -

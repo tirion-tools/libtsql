@@ -101,6 +101,16 @@ bool Str_Equals(CsStr self, CsStr other, StringComparison c) {
 
 std::string Str_ToUpper(CsStr self, CultureInfo) { return AsciiUpper(self.get()); }
 std::string Str_ToUpperInvariant(CsStr self) { return AsciiUpper(self.get()); }
+bool Str_UpperEquals(CsStr self, CsStr other) {
+    const std::string_view s = self.get();
+    if (other.null || s.size() != other.v.size()) return false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+        if (c != other.v[i]) return false;
+    }
+    return true;
+}
 std::string Str_ToLower(CsStr self, CultureInfo) { return AsciiLower(self.get()); }
 std::string Str_ToLowerInvariant(CsStr self) { return AsciiLower(self.get()); }
 int Str_Length(CsStr self) { return Utf16Len(self.get()); }

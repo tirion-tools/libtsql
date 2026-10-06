@@ -20,7 +20,7 @@ bool TSql170ParserBase::ContainsVectorInLookahead() {
     for (int i = 1; i <= LookaheadLimit; i++) {
         antlr4::Token* token = LT(i);
         if (token == nullptr || token->getType() == kEOF) break;
-        if (token->getType() == TT(TK::Identifier) && EqualsIgnoreCase(token->getText(), CodeGenerationSupporter::Vector))
+        if (token->getType() == TT(TK::Identifier) && TextMatches(token, CodeGenerationSupporter::Vector))
             return true;
     }
     return false;

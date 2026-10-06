@@ -22,30 +22,155 @@ antlr4::Token* CaptureStream::LT(ssize_t k) {
     if (t->getType() != antlr4::Token::EOF) return t;
     session_.LookedAtEof();
     if (armed == nullptr) return t;
-    if (session_.InOpaquePredicate()) {
+    if (session_.TrialRun()) {
+        if (!session_.InOpaquePredicate() && get(Position())->getType() == antlr4::Token::EOF) {
+            armed = nullptr;
+            session_.TrialEndReached();
+            throw CaptureDone{};
+        }
+        // a predicate's outcome there is that of a text that ends there; a prediction's reads (LT(1)
+        // as it consumes; ANTLR 2's tests: LT(2), a syntactic predicate's match check) decide its
+        // choice by the end
+        if (session_.InPredicate()) session_.TrialPredicateAtEnd();
+        else if (depth_ > 0) predictionAtEnd_ = true;
+        return t;
+    }
+    if (session_.InDecisionSpeculation()) {
+        // its decision captures once it is done (SessionParser::Antlr2SynPred)
+        session_.SpeculationReachedCaret();
+    } else if (session_.InOpaquePredicate()) {
         session_.EarlyCapture();
-    } else if (k == 1 || session_.ModeledPredicate()) {
-        // LT(k > 1) outside a predicate the walk evaluates is a peek of an action: the parser is
-        // not at the caret yet
-        antlr4::Parser* p = armed;
-        armed = nullptr;
-        session_.CaretReached(*p, Position());
-        throw CaptureDone{};
+    } else if (k == 1 || depth_ > 0 || session_.ModeledPredicate()) {
+        // LT(k > 1) outside a prediction and a predicate the walk evaluates is a peek of an action:
+        // the parser is not at the caret yet
+        CaptureHere();
     }
     return t;
+}
+
+void CaptureStream::CaptureHere() {
+    antlr4::Parser* p = armed;
+    armed = nullptr;
+    session_.CaretReached(*p, Position());
+    throw CaptureDone{};
 }
 
 ssize_t CaptureStream::mark() {
     if (depth_++ == 0) {
         markIndex_ = index();
+        predictionAtEnd_ = false;
         session_.OnDecision();
     }
     return antlr4::CommonTokenStream::mark();
 }
 
 void CaptureStream::release(ssize_t marker) {
-    if (depth_ > 0) --depth_;
+    // (a prediction releases its mark while an exception unwinds it: no alternative fitted)
+    if (depth_ > 0 && --depth_ == 0 && predictionAtEnd_ && std::uncaught_exceptions() > 0 && session_.TrialRun() &&
+        !session_.InPredicate())
+        session_.TrialFailureAtEnd();
     antlr4::CommonTokenStream::release(marker);
+}
+
+// ===================================================================================== simulators
+
+SessionSimulator::SessionSimulator(antlr4::Parser* parser, antlr4::atn::ParserATNSimulator& base)
+    : parser::TSqlParserATNSimulator(parser, base.atn, base.decisionToDFA, base.getSharedContextCache()) {
+    setPredictionMode(base.getPredictionMode());
+}
+
+size_t SessionSimulator::adaptivePredict(antlr4::TokenStream* input, size_t decision,
+                                         antlr4::ParserRuleContext* outerContext) {
+    struct Release {
+        antlr4::TokenStream* input;
+        ssize_t marker;
+        ~Release() { input->release(marker); }
+    } release{input, input->mark()};
+    return parser::TSqlParserATNSimulator::adaptivePredict(input, decision, outerContext);
+}
+
+TrialSimulator::TrialSimulator(antlr4::Parser* parser, antlr4::atn::ParserATNSimulator& base,
+                               CaptureStream& stream, ParseSession& session)
+    : SessionSimulator(parser, base), stream_(stream), session_(session) {}
+
+size_t TrialSimulator::adaptivePredict(antlr4::TokenStream* input, size_t decision,
+                                       antlr4::ParserRuleContext* outerContext) {
+    const size_t alt = SessionSimulator::adaptivePredict(input, decision, outerContext);
+    if (!stream_.Predicting() && !session_.InPredicate() && stream_.PredictionLookedAtEnd()) {
+        if (!session_.TrialChecksChoices()) session_.TrialChoiceUnchecked();
+        else if (!DecidedBeforeEnd(input, decision, outerContext, alt)) session_.TrialChoiceAtEnd();
+    }
+    return alt;
+}
+
+bool TrialSimulator::DecidedBeforeEnd(antlr4::TokenStream* input, size_t decision,
+                                      antlr4::ParserRuleContext* outerContext, size_t alt) {
+    using antlr4::atn::ATN;
+    using antlr4::atn::ATNConfigSet;
+    // the per-prediction fields full-context closure reads (predicates are evaluated on the fly)
+    auto* savedInput = _input;
+    const size_t savedStart = _startIndex;
+    auto* savedOuter = _outerContext;
+    auto* savedDfa = _dfa;
+    const size_t start = input->index();
+    const ssize_t marker = input->mark();
+    struct Restore {
+        TrialSimulator* s;
+        antlr4::TokenStream* input;
+        size_t start;
+        ssize_t marker;
+        antlr4::TokenStream* i;
+        size_t st;
+        antlr4::ParserRuleContext* o;
+        antlr4::dfa::DFA* d;
+        ~Restore() {
+            input->seek(start);
+            input->release(marker);
+            s->_input = i;
+            s->_startIndex = st;
+            s->_outerContext = o;
+            s->_dfa = d;
+        }
+    } restore{this, input, start, marker, savedInput, savedStart, savedOuter, savedDfa};
+    antlr4::dfa::DFA& dfa = decisionToDFA[decision];
+    _input = input;
+    _startIndex = start;
+    _outerContext = outerContext;
+    _dfa = &dfa;
+    try {
+        std::unique_ptr<ATNConfigSet> previous = computeStartState(dfa.atnStartState, outerContext, true);
+        for (size_t t = input->LA(1); t != antlr4::Token::EOF; t = input->LA(1)) {
+            std::unique_ptr<ATNConfigSet> reach = computeReachSet(previous.get(), t, true);
+            if (reach == nullptr) break;   // (full context rejects what the parse takes: no verdict)
+            const size_t unique = getUniqueAlt(reach.get());
+            if (unique != ATN::INVALID_ALT_NUMBER) return unique == alt;
+            previous = std::move(reach);
+            input->consume();
+        }
+    } catch (const CaptureDone&) {
+        throw;
+    } catch (...) {
+        // a predicate failed to evaluate: undecided
+    }
+    return false;
+}
+
+void CaptureStream::Probe(size_t type, std::string text) {
+    std::unique_ptr<antlr4::Token> eof = std::move(_tokens.back());
+    auto t = std::make_unique<SessionToken>(type, std::move(text), eof->getTokenIndex());
+    t->setStartIndex(eof->getStartIndex());
+    t->setStopIndex(eof->getStopIndex());
+    t->setLine(eof->getLine());
+    t->setCharPositionInLine(eof->getCharPositionInLine());
+    _tokens.back() = std::move(t);
+    _tokens.push_back(std::move(eof));
+}
+
+void CaptureStream::Unprobe() {
+    std::unique_ptr<antlr4::Token> eof = std::move(_tokens.back());
+    _tokens.pop_back();
+    _tokens.back() = std::move(eof);
+    seek(std::min(index(), _tokens.size() - 1));
 }
 
 // ========================================================================================== session
@@ -85,6 +210,16 @@ std::string ParseSession::TokenText(size_t i) const {
     return std::string(text);
 }
 
+bool ParseSession::Available() {
+    if (next_ < limit_) return true;
+    // a recording run reads to the end of the text, which its Buffer lexes on demand
+    while (observer_ != nullptr && limit_ == view_.tokens->size() && observer_->MoreTokens()) {
+        limit_ = view_.tokens->size();
+        if (next_ < limit_) return true;
+    }
+    return false;
+}
+
 std::unique_ptr<antlr4::Token> ParseSession::NextToken() {
     const std::vector<LexToken>& toks = *view_.tokens;
     const bool quoted = hooks_ == nullptr || hooks_->QuotedIdentifier();
@@ -109,7 +244,7 @@ std::unique_ptr<antlr4::Token> ParseSession::NextToken() {
         full_.push_back(&t);
         fullToVisible_.push_back(static_cast<uint32_t>(visibleStart_.size()));
     };
-    while (next_ < limit_ && IsHiddenType(toks[next_].type)) {
+    while (Available() && IsHiddenType(toks[next_].type)) {
         auto t = std::make_unique<SessionToken>(toks[next_].type, TokenText(next_), full_.size());
         add(*t, next_, true);
         hidden_.push_back(std::move(t));
@@ -221,6 +356,36 @@ bool ParseSession::OnRuleEnter(antlr4::ParserRuleContext* ctx, size_t rule, antl
 
 void ParseSession::OnEnd() {
     if (observer_ != nullptr) observer_->OnEnd(BufferIndex(stream_->Current()), begin_ + lookEnd_);
+}
+
+// ------------------------------------------------------------------------------------------- trial
+
+void ParseSession::TrialEndReached() {
+    trial_.reached = true;
+    trial_.errors = !errors_.empty();
+}
+
+void ParseSession::TrialChoiceAtEnd() {
+    if (errors_.empty()) trial_.endChoice = true;
+}
+
+void ParseSession::TrialChoiceUnchecked() {
+    if (errors_.empty()) trial_.unchecked = true;
+}
+
+void ParseSession::TrialFailureAtEnd() {
+    if (errors_.empty()) trial_.endFailed = true;
+}
+
+std::optional<Trial> ParseSession::TrialOutcome() const {
+    if (trial_.reached && !trial_.errors) return Trial::Parses;
+    // the parse went wrong where the text ends, or after a choice the end decided: with more text
+    // it may have gone on
+    if (trial_.endFailed || trial_.endChoice) return Trial::Prefix;
+    // an error after choices that looked at the end: their checks decide
+    if (trial_.unchecked) return std::nullopt;
+    // (`t (HOLDLOCK`: IsTableReference wants the `)` after it)
+    return trial_.doubt ? Trial::Undecided : Trial::Fails;
 }
 
 // ---------------------------------------------------------------------------------------- capture

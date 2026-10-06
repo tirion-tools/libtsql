@@ -1,6 +1,7 @@
 #include "Grammar.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "antlr4-runtime.h"
@@ -74,7 +75,8 @@ size_t FixedDistance(const antlr4::atn::ATN& atn, size_t from, size_t to) {
 }  // namespace
 
 void Grammar::Init(SqlVersion v, int flag, antlr4::Parser& parser, const KeywordStateEntry* states, size_t nStates,
-                   const KeywordGuardEntry* guards, const PredicateEntry* preds, size_t nPreds) {
+                   const KeywordGuardEntry* guards, const PredicateEntry* preds, size_t nPreds,
+                   const RuleActionsEntry* actions, const ReturningActionEntry* returning, const int* predicted) {
     version = v;
     versionFlag = flag;
     atn = &parser.getATN();
@@ -110,7 +112,93 @@ void Grammar::Init(SqlVersion v, int flag, antlr4::Parser& parser, const Keyword
         const size_t r = RuleIndex(name);
         if (r != SIZE_MAX) statementRules.push_back(r);
     }
+    // each rule's ACTION transitions in state order are its actions in text order (the ATN builder
+    // numbers elements and actions as it meets them)
+    std::vector<std::vector<size_t>> ruleActions(ruleNames->size());
+    for (const antlr4::atn::ATNState* s : atn->states)   // (in state order)
+        if (s != nullptr && !s->transitions.empty() &&
+            s->transitions[0]->getTransitionType() == antlr4::atn::TransitionType::ACTION)
+            ruleActions[s->ruleIndex].push_back(s->stateNumber);
+    rejectingAction.assign(atn->states.size(), 0);
+    std::vector<uint8_t> mismatched(ruleNames->size(), 0);
+    for (const RuleActionsEntry* e = actions; e->rule != nullptr; ++e) {
+        const size_t rule = RuleIndex(e->rule);
+        if (rule == SIZE_MAX) continue;
+        const std::vector<size_t>& at = ruleActions[rule];
+        if (at.size() != static_cast<size_t>(e->count)) {
+            ++actionTableMismatches;
+            mismatched[rule] = 1;
+            for (size_t s : at) rejectingAction[s] = 1;
+            continue;
+        }
+        for (const char* p = e->rejecting; *p != '\0';) {
+            char* end = nullptr;
+            const unsigned long k = std::strtoul(p, &end, 10);
+            if (end == p) break;
+            if (k < at.size()) rejectingAction[at[k]] = 1;
+            p = end;
+        }
+    }
+    for (const ReturningActionEntry* e = returning; e->rule != nullptr; ++e) {
+        const size_t rule = RuleIndex(e->rule);
+        if (rule == SIZE_MAX || mismatched[rule] || static_cast<size_t>(e->ordinal) >= ruleActions[rule].size()) continue;
+        returningAction.emplace(ruleActions[rule][static_cast<size_t>(e->ordinal)], e->condition);
+    }
+    predictedDecision.assign(atn->states.size(), 0);
+    for (const int* d = predicted; *d >= 0; ++d)
+        if (static_cast<size_t>(*d) < atn->decisionToState.size())
+            predictedDecision[atn->decisionToState[static_cast<size_t>(*d)]->stateNumber] = 1;
     InitTopLevel();
+    InitActionAhead();
+}
+
+void Grammar::InitActionAhead() {
+    using antlr4::atn::TransitionType;
+    const std::vector<antlr4::atn::ATNState*>& states = atn->states;
+    actionAhead.assign(states.size(), 0);
+    for (const antlr4::atn::ATNState* s : states)
+        if (s != nullptr && s->getStateType() == antlr4::atn::ATNStateType::RULE_STOP) actionAhead[s->stateNumber] = kEndAhead;
+    // a fixpoint over the transitions that take no token (a rule stop's transitions lead to every
+    // caller: what follows a rule's end is the walk's business, by its rule calls), up to where the
+    // parser looks at the next token: a decision (inline or predicted; sync's test of a (...)?
+    // block) or a returning action's test. What runs after that runs with the next token there, and
+    // a trial parse (TryParse) whose text ends there stops at it or decides by the end.
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (auto it = states.rbegin(); it != states.rend(); ++it) {
+            const antlr4::atn::ATNState* s = *it;
+            if (s == nullptr || s->getStateType() == antlr4::atn::ATNStateType::RULE_STOP) continue;
+            if (antlr4::atn::DecisionState::is(s) && s->transitions.size() > 1) continue;
+            uint8_t ahead = actionAhead[s->stateNumber];
+            for (const auto& tp : s->transitions) {
+                const antlr4::atn::Transition* t = tp.get();
+                switch (t->getTransitionType()) {
+                    case TransitionType::RULE: {
+                        const auto* rt = static_cast<const antlr4::atn::RuleTransition*>(t);
+                        const uint8_t callee = actionAhead[rt->target->stateNumber];
+                        ahead |= callee & kRejectAhead;
+                        if (callee & kEndAhead) ahead |= actionAhead[rt->followState->stateNumber];
+                        break;
+                    }
+                    case TransitionType::ACTION:
+                        if (rejectingAction[s->stateNumber] != 0) ahead |= kRejectAhead;
+                        if (returningAction.count(s->stateNumber) == 0) ahead |= actionAhead[t->target->stateNumber];
+                        break;
+                    case TransitionType::EPSILON:
+                    case TransitionType::PREDICATE:
+                    case TransitionType::PRECEDENCE:
+                        ahead |= actionAhead[t->target->stateNumber];
+                        break;
+                    default:   // takes a token
+                        break;
+                }
+            }
+            if (ahead != actionAhead[s->stateNumber]) {
+                actionAhead[s->stateNumber] = ahead;
+                changed = true;
+            }
+        }
+    }
 }
 
 namespace {

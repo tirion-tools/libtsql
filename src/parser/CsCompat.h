@@ -55,6 +55,8 @@ bool String_IsNullOrEmpty(CsStr a);
 bool Str_Equals(CsStr self, CsStr other, StringComparison c = StringComparison::Ordinal);
 std::string Str_ToUpper(CsStr self, CultureInfo = CultureInfo::CurrentCulture);
 std::string Str_ToUpperInvariant(CsStr self);
+/// self.ToUpper[Invariant]() == other, without building the upper-case copy
+bool Str_UpperEquals(CsStr self, CsStr other);
 std::string Str_ToLower(CsStr self, CultureInfo = CultureInfo::CurrentCulture);
 std::string Str_ToLowerInvariant(CsStr self);
 int Str_Length(CsStr self);

@@ -2,7 +2,8 @@
 #   - Microsoft SqlScriptDOM @ eaf3a6e (MIT): Ast.xml, the TSql<ver>.g grammars and the C# sources
 #     the generators read (tools/astgen, tools/g2to4)
 #   - ANTLR 4.13.2: the tool (complete jar, run with Java at build time) and the C++ runtime
-#     (built here as the static library antlr4_static)
+#     (built here as the static library antlr4_static), with local warning fixes from
+#     cmake/patches/antlr4-runtime.cmake (grep [libtsql] in the runtime sources)
 # Needs Python 3 and a Java runtime. Everything generated lives in the build tree.
 if(CMAKE_VERSION VERSION_LESS 3.28)   # FetchContent_Declare(... EXCLUDE_FROM_ALL SYSTEM)
     message(FATAL_ERROR "TSQL_BUILD_PARSER_PILOT needs CMake 3.28 or newer")
@@ -37,10 +38,16 @@ set(ANTLR_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ANTLR_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(WITH_DEMO OFF CACHE BOOL "" FORCE)
 set(ANTLR4_INSTALL OFF CACHE BOOL "" FORCE)
+# The patch runs once per population of the source (an edit to the script changes its hash in the
+# command, which re-runs it). FETCHCONTENT_SOURCE_DIR_TSQL_ANTLR4 skips patching: a source given
+# that way must already carry cmake/patches/antlr4-runtime.cmake (cmake -P it in that directory).
+set(_tsql_antlr_patch ${CMAKE_CURRENT_LIST_DIR}/patches/antlr4-runtime.cmake)
+file(SHA256 ${_tsql_antlr_patch} _tsql_antlr_patch_hash)
 FetchContent_Declare(tsql_antlr4
     URL https://github.com/antlr/antlr4/archive/refs/tags/${TSQL_ANTLR_VERSION}.tar.gz
     URL_HASH SHA256=9f18272a9b32b622835a3365f850dd1063d60f5045fb1e12ce475ae6e18a35bb
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+    PATCH_COMMAND ${CMAKE_COMMAND} -DTSQL_PATCH_HASH=${_tsql_antlr_patch_hash} -P ${_tsql_antlr_patch}
     SOURCE_SUBDIR runtime/Cpp
     EXCLUDE_FROM_ALL
     SYSTEM)
