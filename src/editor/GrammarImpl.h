@@ -10,16 +10,18 @@
 
 namespace tsql::editor::detail {
 
-template <class Lexer, class Parser>
+// The generated classes are named apart from antlr4::Lexer / antlr4::Parser: inside the nested
+// session classes MSVC resolves an unqualified Lexer/Parser to those indirect bases.
+template <class GeneratedLexer, class GeneratedParser>
 class GrammarImpl final : public Grammar {
 public:
     GrammarImpl(SqlVersion v, int flag, const KeywordStateEntry* states, size_t nStates, const KeywordGuardEntry* guards,
                 const PredicateEntry* preds, size_t nPreds, const RuleActionsEntry* actions,
                 const ReturningActionEntry* returning, const int* predicted) {
         antlr4::ANTLRInputStream input("");
-        Lexer lexer(&input);
+        GeneratedLexer lexer(&input);
         antlr4::CommonTokenStream tokens(&lexer);
-        Parser parser(&tokens);
+        GeneratedParser parser(&tokens);
         Init(v, flag, parser, states, nStates, guards, preds, nPreds, actions, returning, predicted);
     }
 
@@ -145,19 +147,19 @@ private:
     };
 
     /// The lexer's only state between tokens: whether GO may start the next token (it starts a line).
-    class SessionLexer final : public Lexer {
+    class SessionLexer final : public GeneratedLexer {
     public:
-        using Lexer::Lexer;
+        using GeneratedLexer::GeneratedLexer;
         void SetGoAcceptable(bool on) { this->_acceptableGoOffset = on ? this->CurrentOffset() : -1; }
         bool GoAcceptable() { return this->_acceptableGoOffset == this->CurrentOffset(); }
     };
 
     /// The parser of a session: tells the session which predicate is being evaluated, every consumed
     /// token and every predicate that held, and every rule it leaves; resumes a parse.
-    class SessionParser final : public Parser, public SessionParserHooks {
+    class SessionParser final : public GeneratedParser, public SessionParserHooks {
     public:
         SessionParser(antlr4::TokenStream* input, ParseSession& session, const Grammar& g)
-            : Parser(input), session_(session), g_(g) {}
+            : GeneratedParser(input), session_(session), g_(g) {}
 
         bool QuotedIdentifier() const override { return this->_quotedIdentifier; }
 
@@ -173,7 +175,7 @@ private:
 
         antlr4::Token* consume() override {
             if (session_.Recording()) session_.OnConsume(*this);
-            return Parser::consume();
+            return GeneratedParser::consume();
         }
 
         bool sempred(antlr4::RuleContext* ctx, size_t ruleIndex, size_t predicateIndex) override {
@@ -183,7 +185,7 @@ private:
                 ~Current() { s.LeavePredicate(index); }
             } current{session_, predicateIndex};
             session_.EnterPredicate(*this, predicateIndex);
-            const bool result = Parser::sempred(ctx, ruleIndex, predicateIndex);
+            const bool result = GeneratedParser::sempred(ctx, ruleIndex, predicateIndex);
             if (session_.Recording()) session_.OnPredicate(*this, predicateIndex, result);
             return result;
         }
@@ -198,7 +200,7 @@ private:
                     ~Current() { s.LeavePredicate(ParseSession::kSyntacticPredicate); }
                 } current{session_};
                 session_.EnterPredicate(*this, ParseSession::kSyntacticPredicate);
-                matched = Parser::Antlr2SynPred(marker, ctx);
+                matched = GeneratedParser::Antlr2SynPred(marker, ctx);
             }
             // (after the speculation has restored the parser: the decision's state and context)
             if (session_.TakeSpeculationAtCaret()) session_.Stream().CaptureHere();
@@ -209,7 +211,7 @@ private:
             if (!replaying_ && !this->Guessing() && session_.Recording() &&
                 !session_.OnRuleEnter(localctx, ruleIndex, this->_ctx, this->_quotedIdentifier))
                 throw StopParse{};
-            Parser::enterRule(localctx, state, ruleIndex);
+            GeneratedParser::enterRule(localctx, state, ruleIndex);
         }
 
         /// Parses from `from` as the script's own parse continues there: script() at its start;
@@ -218,8 +220,8 @@ private:
         /// batch() and script() after that point). `ready` runs once the parser stands at `from`.
         template <class Ready>
         void Resume(const ResumePoint& from, const Ready& ready) {
-            using Script = typename Parser::ScriptContext;
-            using Batch = typename Parser::BatchContext;
+            using Script = typename GeneratedParser::ScriptContext;
+            using Batch = typename GeneratedParser::BatchContext;
             const TopLevelStates& t = g_.top;
             if (from.kind == ResumePoint::Kind::ScriptStart) {
                 ready();
@@ -296,9 +298,9 @@ private:
                 this->setState(t.scriptLoopBack);
                 this->_errHandler->sync(this);
                 size_t la = this->_input->LA(1);
-                while (la == Parser::Go) {
+                while (la == GeneratedParser::Go) {
                     this->setState(t.scriptGo);
-                    this->match(Parser::Go);
+                    this->match(GeneratedParser::Go);
                     this->ResetQuotedIdentifiersSettingToInitial();
                     this->ThrowPartialAstIfPhaseOne(nullptr);
                     this->setState(t.scriptLoopBatchCall);
@@ -308,7 +310,7 @@ private:
                     la = this->_input->LA(1);
                 }
                 this->setState(t.scriptEof);
-                this->match(Parser::EOF);
+                this->match(GeneratedParser::EOF);
             } catch (antlr4::RecognitionException& e) {
                 this->_errHandler->reportError(this, e);
                 this->_errHandler->recover(this, std::current_exception());
