@@ -1,4 +1,4 @@
-// libtsql parser pilot: structural JSON dump of an AST (diffed against the .NET oracle's dump).
+// libtsql AST: structural JSON dump of an AST (diffed against the .NET oracle's dump).
 #pragma once
 
 #include <string>

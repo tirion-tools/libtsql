@@ -1,4 +1,4 @@
-// libtsql parser pilot: .NET Enum.ToString() formatting for the generated enum tables.
+// libtsql AST: .NET Enum.ToString() formatting for the generated enum tables.
 #pragma once
 
 #include <cstddef>

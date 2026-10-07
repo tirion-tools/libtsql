@@ -1,4 +1,4 @@
-// libtsql parser pilot: C++ AST of Microsoft SqlScriptDOM (MIT) @ eaf3a6e.
+// libtsql AST: C++ AST of Microsoft SqlScriptDOM (MIT) @ eaf3a6e.
 //
 // Every Ast.xml class is a struct of the same name in tsql::ast deriving from its Ast.xml base
 // (TSqlFragment by default). Members are public fields with the Ast.xml names:

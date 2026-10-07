@@ -152,7 +152,7 @@ void TSql80ParserBase::RecoverAtStatementLevel(int statementStartLine, int state
     int nextTokenLine = static_cast<int>(LT(1)->getLine());
     int nextTokenColumn = static_cast<int>(LT(1)->getCharPositionInLine());
     if (nextTokenLine == statementStartLine && nextTokenColumn == statementStartColumn) {
-        // phase-one re-entry (PhaseOneBatchException) is not part of the pilot
+        // phase-one re-entry (PhaseOneBatchException) is not ported
         consume();
     }
 }
@@ -160,7 +160,7 @@ void TSql80ParserBase::RecoverAtStatementLevel(int statementStartLine, int state
 void TSql80ParserBase::RecoverAtBatchLevel() { ConsumeUntil({TT(TK::Go)}); }
 
 void TSql80ParserBase::ThrowPartialAstIfPhaseOne(ast::TSqlStatement*) {
-    // PhaseOne is always false in the pilot (PhaseOneParse / TryParseSqlModuleObjectName are not ported)
+    // PhaseOne is always false here (PhaseOneParse / TryParseSqlModuleObjectName are not ported)
 }
 
 bool TSql80ParserBase::NextTokenMatches(const std::string& keyword) {

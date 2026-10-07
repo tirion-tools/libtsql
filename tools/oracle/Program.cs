@@ -1,4 +1,4 @@
-// Reference ("oracle") dumper for the libtsql ANTLR4 pilot.
+// Reference ("oracle") dumper for libtsql's ANTLR 4 parsers.
 //
 // Parses T-SQL with Microsoft.SqlServer.TransactSql.ScriptDom's TSql170Parser(initialQuotedIdentifiers: true)
 // and writes the shared JSON dump format that the C++ port also emits, so the two can be diffed structurally.

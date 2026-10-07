@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
         }
         std::stringstream ss;
         ss << in.rdbuf();
-        std::string text = tsql::pilot::DecodeScriptFile(ss.str());
+        std::string text = tsql::tools::DecodeScriptFile(ss.str());
 
         tsql::ParseResult r = tsql::parse(text, version, true);
         std::vector<tsql::ast::DumpError> errors;

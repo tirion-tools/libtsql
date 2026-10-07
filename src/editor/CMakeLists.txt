@@ -61,8 +61,9 @@ add_library(tsql_editor STATIC
 )
 add_dependencies(tsql_editor tsql_editor_generate)
 add_library(tsql::editor ALIAS tsql_editor)
+set_target_properties(tsql_editor PROPERTIES EXPORT_NAME editor)
 target_include_directories(tsql_editor
-    PUBLIC ${TSQL_EDITOR_ROOT}/include
+    PUBLIC $<BUILD_INTERFACE:${TSQL_EDITOR_ROOT}/include> $<INSTALL_INTERFACE:include>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${TSQL_EDITOR_ROOT}/src/parser ${parser_bin})
 target_link_libraries(tsql_editor PUBLIC tsql_parser PRIVATE antlr4_static)
 target_compile_features(tsql_editor PUBLIC cxx_std_17)
@@ -70,6 +71,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(tsql_editor PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
-add_executable(tsql_editor_probe ${PROJECT_SOURCE_DIR}/pilot/editor_probe.cpp)
+add_executable(tsql_editor_probe ${PROJECT_SOURCE_DIR}/tools/editor_probe/editor_probe.cpp)
 target_link_libraries(tsql_editor_probe PRIVATE tsql_editor antlr4_static)
 target_include_directories(tsql_editor_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${TSQL_EDITOR_ROOT}/src/parser ${parser_bin})

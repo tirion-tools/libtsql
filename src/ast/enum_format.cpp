@@ -1,4 +1,4 @@
-// libtsql parser pilot: .NET Enum.ToString() formatting (mirrors System.Enum's name lookup and
+// libtsql AST: .NET Enum.ToString() formatting (mirrors System.Enum's name lookup and
 // [Flags] decomposition: largest-first greedy match, names joined ascending with ", ").
 #include "enum_format.hpp"
 

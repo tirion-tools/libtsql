@@ -1,5 +1,5 @@
 // Ported from Microsoft SqlScriptDOM (MIT) @ eaf3a6e: SqlScriptDom/Parser/TSql/OptionsHelper.cs
-// (parsing half only; the script-generation members are not part of the parser pilot).
+// (parsing half only; libtsql has no script generator, so the script-generation members are not ported).
 #pragma once
 
 #include <map>

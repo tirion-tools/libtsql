@@ -4,9 +4,9 @@ C++ T-SQL lexer, parser and editor support. MIT-licensed.
 
 ### Status
 
-v0.1: lexer. The token stream recognises bare / `[bracketed]` / `"quoted"` identifiers, 169 T-SQL reserved keywords (case-insensitive), string + numeric + Unicode literals, line and (nested) block comments, variables (`@`, `@@`), temp-name prefixes (`#`, `##`), and operators / punctuation. Byte offsets into the source are preserved so callers can stitch tokens back into rewritten output.
+v0.2. Lexer: the token stream recognises bare / `[bracketed]` / `"quoted"` identifiers, 169 T-SQL reserved keywords (case-insensitive), string + numeric + Unicode literals, line and (nested) block comments, variables (`@`, `@@`), temp-name prefixes (`#`, `##`), and operators / punctuation. Byte offsets into the source are preserved so callers can stitch tokens back into rewritten output.
 
-Parser pilot (`-DTSQL_BUILD_PARSER_PILOT=ON`): SqlScriptDOM's TSql130–TSql180 and TSqlFabricDW grammars, converted to ANTLR 4 at build time, produce SqlScriptDOM's AST and parse errors (`tsql::parse`); an editor layer on top of them completes and colours T-SQL (`tsql::editor`). The script generator is not implemented.
+Parser (`-DTSQL_BUILD_PARSER=ON`): SqlScriptDOM's TSql130–TSql180 and TSqlFabricDW grammars, converted to ANTLR 4 at build time, produce SqlScriptDOM's AST and parse errors (`tsql::parse`); an editor layer on top of them completes and colours T-SQL (`tsql::editor`). The script generator is not implemented.
 
 ### Public API
 
@@ -27,7 +27,7 @@ auto out = tsql::anonymize_identifiers(
 // out == "SELECT [Tbl_1].Col_1 FROM Tbl_1"
 ```
 
-### Parser (pilot)
+### Parser
 
 ```cpp
 #include <tsql/parser.hpp>
@@ -40,7 +40,7 @@ tsql::ParseResult r = tsql::parse(sql, tsql::SqlVersion::Sql170);   // UTF-8 inp
 
 `tsql::parse` throws `std::invalid_argument` for a version whose grammar is not in the build (`tsql::IsParserAvailable`).
 
-### Editor support (pilot)
+### Editor support
 
 `#include <tsql/editor.hpp>`, CMake target `tsql::editor`. Offsets are UTF-8 byte offsets.
 
@@ -94,11 +94,24 @@ ctest --test-dir build
 
 Options:
 
-- `TSQL_BUILD_PARSER_PILOT` (default `OFF`): build the AST, the parsers (`tsql::parser`), the editor support (`tsql::editor`), their tests and the `tsql_dump`, `tsql_bench` and `tsql_editor_probe` tools. Needs Python 3 and a Java runtime; CMake fetches pinned SqlScriptDOM sources and the ANTLR 4.13.2 tool and C++ runtime.
+- `TSQL_BUILD_PARSER` (default `OFF`): build the AST (`tsql::ast`), the parsers (`tsql::parser`), the editor support (`tsql::editor`), their tests and the `tsql_dump`, `tsql_bench` and `tsql_editor_probe` tools. Needs CMake 3.28+, Python 3 and a Java runtime; CMake fetches pinned SqlScriptDOM sources and the ANTLR 4.13.2 tool and C++ runtime.
 - `TSQL_PARSER_GRAMMARS` (default all: `TSql130;TSql140;TSql150;TSql160;TSql170;TSql180;TSqlFabricDW`): the grammars to build. Each takes about a minute to compile.
 - `TSQL_PARSER_PARTS` (default 5): translation units each generated parser's rules are split into (each needs up to ~1.4 GB to compile).
 - `TSQL_PARSER_COMPILE_JOBS` (default empty: half the memory free at configure time / 1.6 GB, at least 1): with Ninja, how many parser translation units compile at once, whatever `-j` says.
-- `TSQL_BUILD_TESTS` (default `ON`), `TSQL_INSTALL` (default `ON`).
+- `TSQL_BUILD_TESTS` (default `ON`), `TSQL_INSTALL` (default `ON`: install rules and the CMake package).
+
+### Use from CMake
+
+As a subdirectory: `add_subdirectory(libtsql)`, then link `tsql::tsql` (and, built with `TSQL_BUILD_PARSER=ON`, `tsql::ast`, `tsql::parser` or `tsql::editor`).
+
+Installed (`cmake --install build --prefix <prefix>`, then `<prefix>` in `CMAKE_PREFIX_PATH`):
+
+```cmake
+find_package(tsql 0.2 CONFIG REQUIRED)                     # tsql::tsql
+find_package(tsql 0.2 CONFIG REQUIRED COMPONENTS editor)   # + tsql::ast, tsql::parser, tsql::editor
+```
+
+The components `ast`, `parser` and `editor` exist when libtsql was built with `TSQL_BUILD_PARSER=ON`. That package holds the generated AST headers and the ANTLR 4 C++ runtime the parsers link (`tsql_antlr4_runtime`; its BSD-3-Clause license is installed as `share/doc/tsql/LICENSE.antlr4.txt`), so a consumer needs neither Python, Java nor an installed ANTLR. The libraries are static: with MSVC, build the consumer with the same configuration and runtime library (`CMAKE_MSVC_RUNTIME_LIBRARY`). `tests/install` is such a consumer (run by CI).
 
 ### Where it's used
 

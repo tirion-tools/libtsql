@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// libtsql parser pilot: hand-built AST -> DumpJson text (format shared with the .NET oracle).
+// libtsql AST: hand-built AST -> DumpJson text (format shared with the .NET oracle).
 #include "tsql/ast/ast.hpp"
 
 #include <iostream>

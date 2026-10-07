@@ -1,4 +1,4 @@
-// libtsql parser pilot: structural JSON dump of an AST (format shared with the .NET oracle).
+// libtsql AST: structural JSON dump of an AST (format shared with the .NET oracle).
 #include "tsql/ast/dump.hpp"
 
 #include "json_writer.hpp"

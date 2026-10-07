@@ -1,11 +1,11 @@
-// Script file decoding for the pilot tools (tsql_dump, tsql_bench): bytes -> UTF-8 text the way .NET's
+// Script file decoding for the parser tools (tsql_dump, tsql_bench): bytes -> UTF-8 text the way .NET's
 // StreamReader decodes them for SqlScriptDOM: BOM detection (UTF-8, UTF-16 LE/BE), UTF-8 by default.
 #pragma once
 
 #include <initializer_list>
 #include <string>
 
-namespace tsql::pilot {
+namespace tsql::tools {
 
 inline void AppendUtf8(std::string& out, char32_t cp) {
     if (cp < 0x80) {
@@ -62,4 +62,4 @@ inline std::string DecodeScriptFile(const std::string& bytes) {
     return bytes;   // UTF-8; invalid sequences become U+FFFD inside tsql::parse
 }
 
-}  // namespace tsql::pilot
+}  // namespace tsql::tools

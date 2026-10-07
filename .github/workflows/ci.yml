@@ -1,7 +1,8 @@
-# Builds libtsql with the parsers and the editor layer and runs ctest.
+# Builds libtsql with the parsers and the editor layer (TSQL_BUILD_PARSER) and runs ctest.
 #   windows-msvc:   the way Calliper's Windows release builds it (Visual Studio generator, MSVC,
 #                   static runtime, Release).
-#   linux-gcc:      Ninja + GCC.
+#   linux-gcc:      Ninja + GCC; also installs the package (with the parsers, and lexer-only) and
+#                   builds and runs tests/install against each.
 #   linux-asan:     Ninja + Clang, AddressSanitizer + UndefinedBehaviorSanitizer (LeakSanitizer on).
 #   linux-tsan:     Ninja + Clang, ThreadSanitizer.
 # The parser build fetches pinned SqlScriptDOM sources and the ANTLR 4.13.2 tool and runtime, and
@@ -10,7 +11,7 @@ name: ci
 
 on:
   push:
-    branches: [master, antlr4-pilot]
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -31,7 +32,7 @@ jobs:
         run: |
           $env:JAVA_HOME = $env:JAVA_HOME_21_X64
           $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
-          cmake -S . -B build -DTSQL_BUILD_PARSER_PILOT=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake -S . -B build -DTSQL_BUILD_PARSER=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
       - name: Build
         run: cmake --build build --config Release --parallel 2
       - name: Test
@@ -46,11 +47,28 @@ jobs:
       - name: Install Ninja
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTSQL_BUILD_PARSER_PILOT=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTSQL_BUILD_PARSER=ON
       - name: Build
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Installed package
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/tsql"
+          cmake -S tests/install -B build-consumer -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tsql" -DTSQL_WITH_PARSER=ON
+          cmake --build build-consumer
+          build-consumer/lexer_consumer
+          build-consumer/editor_consumer
+      - name: Installed package, lexer only
+        run: |
+          cmake -S . -B build-lexer -G Ninja -DCMAKE_BUILD_TYPE=Release -DTSQL_BUILD_TESTS=OFF
+          cmake --build build-lexer
+          cmake --install build-lexer --prefix "$RUNNER_TEMP/tsql-lexer"
+          cmake -S tests/install -B build-consumer-lexer -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tsql-lexer"
+          cmake --build build-consumer-lexer
+          build-consumer-lexer/lexer_consumer
 
   # Clang 18 is the image's default Clang (runner-images Ubuntu2404-Readme: Clang 16.0.6, 17.0.6,
   # 18.1.3); its sanitizer runtimes are in libclang-rt-18-dev. A sanitized parser translation unit
@@ -82,7 +100,7 @@ jobs:
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTSQL_BUILD_PARSER_PILOT=ON
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTSQL_BUILD_PARSER=ON
           -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18
           "-DCMAKE_CXX_FLAGS=-fsanitize=${{ matrix.sanitize }} -fno-sanitize-recover=all -fno-omit-frame-pointer"
           -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=${{ matrix.sanitize }}

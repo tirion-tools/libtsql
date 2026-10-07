@@ -31,8 +31,9 @@ add_custom_command(
     COMMENT "astgen: generating the AST from SqlScriptDOM's Ast.xml"
     VERBATIM)
 add_custom_target(tsql_ast_generate DEPENDS ${TSQL_AST_GENERATED_HEADERS} ${TSQL_AST_GENERATED_SOURCES})
-# for tools/g2to4 (src/parser): the generated member enums
+# for tools/g2to4 (src/parser): the generated member enums; for the install: the generated headers
 set(TSQL_AST_ENUMS_HPP ${gen_inc}/enums.hpp PARENT_SCOPE)
+set(TSQL_AST_GENERATED_INCLUDE_DIR ${gen_inc_root} PARENT_SCOPE)
 
 add_library(tsql_ast STATIC
     token.cpp
@@ -48,8 +49,9 @@ add_library(tsql_ast STATIC
 )
 add_dependencies(tsql_ast tsql_ast_generate)
 add_library(tsql::ast ALIAS tsql_ast)
+set_target_properties(tsql_ast PROPERTIES EXPORT_NAME ast)
 target_include_directories(tsql_ast
-    PUBLIC ${TSQL_AST_ROOT}/include ${gen_inc_root}
+    PUBLIC $<BUILD_INTERFACE:${TSQL_AST_ROOT}/include> $<BUILD_INTERFACE:${gen_inc_root}> $<INSTALL_INTERFACE:include>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_features(tsql_ast PUBLIC cxx_std_17)

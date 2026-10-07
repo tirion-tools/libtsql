@@ -143,8 +143,9 @@ add_library(tsql_parser STATIC
 add_dependencies(tsql_parser tsql_parser_generate)
 set_property(TARGET tsql_parser PROPERTY JOB_POOL_COMPILE tsql_parser_compile)
 add_library(tsql::parser ALIAS tsql_parser)
+set_target_properties(tsql_parser PROPERTIES EXPORT_NAME parser)
 target_include_directories(tsql_parser
-    PUBLIC ${TSQL_PARSER_ROOT}/include
+    PUBLIC $<BUILD_INTERFACE:${TSQL_PARSER_ROOT}/include> $<INSTALL_INTERFACE:include>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(tsql_parser PUBLIC tsql_ast PRIVATE antlr4_static)
 target_compile_features(tsql_parser PUBLIC cxx_std_17)
@@ -155,6 +156,6 @@ endif()
 add_executable(tsql_dump tsql_dump.cpp)
 target_link_libraries(tsql_dump PRIVATE tsql_parser)
 
-add_executable(tsql_bench ${PROJECT_SOURCE_DIR}/pilot/bench.cpp)
+add_executable(tsql_bench ${PROJECT_SOURCE_DIR}/tools/bench/bench.cpp)
 target_link_libraries(tsql_bench PRIVATE tsql_parser)
 target_include_directories(tsql_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

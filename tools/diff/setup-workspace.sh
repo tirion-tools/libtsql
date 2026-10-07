@@ -7,7 +7,7 @@
 # depends on it. Needs dotnet (SDK 10), java, PowerShell 7 (pwsh or pwsh-preview), python3, curl.
 #
 # Steps:
-#   ssd           SqlScriptDOM @ the commit pinned in cmake/TsqlParserPilot.cmake, copied from the
+#   ssd           SqlScriptDOM @ the commit pinned in cmake/TsqlParser.cmake, copied from the
 #                 build's FetchContent source when present, else fetched and checked by SHA-256
 #   antlr2        antlr-2.7.5.jar (SHA-256 pinned), which ScriptDom's own build would download unchecked
 #   ssd-build     ScriptDom built from that source (net8.0, run on the newer runtime: DOTNET_ROLL_FORWARD
@@ -35,10 +35,10 @@ ANTLR2_URL=https://www.antlr2.org/download/antlr-2.7.5.jar
 ANTLR2_SHA256=2433e7e36ebbebe72390036ec555f4c6771eaed33d507b3d5d65497804093a0d   # = Maven Central antlr:antlr:2.7.5
 JOBS=6   # oracle dump threads
 
-pin() { sed -n "s/^ *$1[ =]\([0-9a-f]\{40,64\}\).*/\1/p" "$ROOT/cmake/TsqlParserPilot.cmake" | head -1; }
+pin() { sed -n "s/^ *$1[ =]\([0-9a-f]\{40,64\}\).*/\1/p" "$ROOT/cmake/TsqlParser.cmake" | head -1; }
 SSD_COMMIT=$(pin 'set(TSQL_SSD_COMMIT')
-SSD_SHA256=$(sed -n '/FetchContent_Declare(tsql_sqlscriptdom/,/)/s/.*URL_HASH SHA256=\([0-9a-f]*\).*/\1/p' "$ROOT/cmake/TsqlParserPilot.cmake")
-[ -n "$SSD_COMMIT" ] && [ -n "$SSD_SHA256" ] || { echo "cannot read the SqlScriptDOM pin from cmake/TsqlParserPilot.cmake" >&2; exit 1; }
+SSD_SHA256=$(sed -n '/FetchContent_Declare(tsql_sqlscriptdom/,/)/s/.*URL_HASH SHA256=\([0-9a-f]*\).*/\1/p' "$ROOT/cmake/TsqlParser.cmake")
+[ -n "$SSD_COMMIT" ] && [ -n "$SSD_SHA256" ] || { echo "cannot read the SqlScriptDOM pin from cmake/TsqlParser.cmake" >&2; exit 1; }
 
 force=()
 while [ $# -gt 0 ]; do

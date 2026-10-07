@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// libtsql parser pilot: TSqlFragmentVisitor / TSqlConcreteFragmentVisitor over a hand-built tree.
+// libtsql AST: TSqlFragmentVisitor / TSqlConcreteFragmentVisitor over a hand-built tree.
 // Expected logs match Microsoft.SqlServer.TransactSql.ScriptDom 180.117.0 for the same tree.
 #include "tsql/ast/ast.hpp"
 

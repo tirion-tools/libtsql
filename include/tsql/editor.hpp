@@ -1,6 +1,6 @@
 // libtsql editor support: completion and colouring for T-SQL editors, driven by the version's
-// parser (tsql::parse's grammars). Built with the parser (TSQL_BUILD_PARSER_PILOT), CMake target
-// tsql_editor.
+// parser (tsql::parse's grammars). Built with the parser (TSQL_BUILD_PARSER), CMake target
+// tsql::editor.
 #pragma once
 
 #include <chrono>

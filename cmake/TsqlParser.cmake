@@ -1,4 +1,4 @@
-# Inputs of the ANTLR 4 parser pilot (TSQL_BUILD_PARSER_PILOT), fetched by the build and pinned:
+# Inputs of the ANTLR 4 parsers (TSQL_BUILD_PARSER), fetched by the build and pinned:
 #   - Microsoft SqlScriptDOM @ eaf3a6e (MIT): Ast.xml, the TSql<ver>.g grammars and the C# sources
 #     the generators read (tools/astgen, tools/g2to4)
 #   - ANTLR 4.13.2: the tool (complete jar, run with Java at build time) and the C++ runtime
@@ -6,7 +6,7 @@
 #     cmake/patches/antlr4-runtime.cmake (grep [libtsql] in the runtime sources)
 # Needs Python 3 and a Java runtime. Everything generated lives in the build tree.
 if(CMAKE_VERSION VERSION_LESS 3.28)   # FetchContent_Declare(... EXCLUDE_FROM_ALL SYSTEM)
-    message(FATAL_ERROR "TSQL_BUILD_PARSER_PILOT needs CMake 3.28 or newer")
+    message(FATAL_ERROR "TSQL_BUILD_PARSER needs CMake 3.28 or newer")
 endif()
 cmake_policy(VERSION 3.28)   # include() scopes policies: the rest of the project is unaffected
 include(FetchContent)
@@ -17,12 +17,12 @@ set(TSQL_ANTLR_VERSION 4.13.2)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(NOT Python3_Interpreter_FOUND)
-    message(FATAL_ERROR "TSQL_BUILD_PARSER_PILOT needs a Python 3 interpreter: the AST and the "
+    message(FATAL_ERROR "TSQL_BUILD_PARSER needs a Python 3 interpreter: the AST and the "
                         "parsers are generated at build time by tools/astgen and tools/g2to4.")
 endif()
 find_package(Java COMPONENTS Runtime)
 if(NOT Java_Runtime_FOUND OR NOT Java_VERSION_STRING)   # FindJava "finds" a java that fails to run
-    message(FATAL_ERROR "TSQL_BUILD_PARSER_PILOT needs a Java runtime (java): the ANTLR "
+    message(FATAL_ERROR "TSQL_BUILD_PARSER needs a Java runtime (java): the ANTLR "
                         "${TSQL_ANTLR_VERSION} tool runs at build time to generate the parsers.")
 endif()
 

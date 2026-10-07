@@ -1,0 +1,19 @@
+@PACKAGE_INIT@
+
+# tsql::tsql (the lexer), plus tsql::ast, tsql::parser and tsql::editor (components ast, parser,
+# editor) when libtsql was built with TSQL_BUILD_PARSER.
+set(_tsql_with_parser @TSQL_BUILD_PARSER@)
+if(_tsql_with_parser)
+    include(CMakeFindDependencyMacro)
+    find_dependency(Threads)   # the ANTLR 4 runtime linked into the parsers
+endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/tsqlTargets.cmake)
+
+set(tsql_lexer_FOUND TRUE)
+foreach(_tsql_component ast parser editor)
+    set(tsql_${_tsql_component}_FOUND ${_tsql_with_parser})
+endforeach()
+unset(_tsql_component)
+unset(_tsql_with_parser)
+check_required_components(tsql)

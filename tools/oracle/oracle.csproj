@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>oracle</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <!-- Pinned: the oracle reported in the pilot uses 180.117.0. Override only for gap checks
+    <!-- Pinned: the TSql170 gates were recorded with 180.117.0. Override only for gap checks
          (e.g. -p:ScriptDomVersion=180.102.0 -p:OracleBuildRoot=/tmp/...). -->
     <ScriptDomVersion Condition="'$(ScriptDomVersion)' == ''">180.117.0</ScriptDomVersion>
   </PropertyGroup>

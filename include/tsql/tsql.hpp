@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // libtsql - C++ T-SQL lexer.
 //
-// v0.1 surface: tokenize a T-SQL fragment into a token stream and run a
-// thin identifier-rewriter on top of it. Parser + AST will follow.
+// Tokenize a T-SQL fragment into a token stream and run a thin identifier-rewriter on top of it.
+// The parser and the editor support are in tsql/parser.hpp and tsql/editor.hpp (TSQL_BUILD_PARSER).
 #pragma once
 
 #include <cstddef>

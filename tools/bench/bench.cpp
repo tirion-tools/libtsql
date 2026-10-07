@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
         std::ifstream in(argv[i], std::ios::binary);
         std::stringstream text;
         text << in.rdbuf();
-        std::string s = tsql::pilot::DecodeScriptFile(text.str());
+        std::string s = tsql::tools::DecodeScriptFile(text.str());
         bytes += s.size();
         inputs.push_back(std::move(s));
     }

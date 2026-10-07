@@ -1,4 +1,4 @@
-// libtsql parser pilot: JSON writer used by the generated DumpJson member walkers.
+// libtsql AST: JSON writer used by the generated DumpJson member walkers.
 #pragma once
 
 #include <cstdint>
