@@ -359,8 +359,10 @@ const char* const kScripts[] = {
     "IF EXISTS (SELECT 1 FROM sys.objects) BEGIN SELECT 1; SELECT 2 END ELSE SELECT 3\n"
     "WITH x AS (SELECT 1 AS n) SELECT n FROM x;\nEXEC dbo.usp_Get @id = 1\nGO\nCREATE VIEW v AS SELECT 1 AS a\n",
     "SET QUOTED_IDENTIFIER OFF\nSELECT \"text\" FROM t\nGO\nSELECT \"col\" FROM t\n/* comment\n spanning */ SELECT 1 -- x\n",
-    "BEGIN TRY\n  INSERT INTO t (a) VALUES (1)\nEND TRY\nBEGIN CATCH\n  THROW\nEND CATCH\nMERGE t USING s ON t.a = s.a "
-    "WHEN MATCHED THEN UPDATE SET a = 1;\n",
+    // (one script: TRY/CATCH, then a MERGE)
+    "BEGIN TRY\n  INSERT INTO t (a) VALUES (1)\nEND TRY\n"
+    "BEGIN CATCH\n  THROW\nEND CATCH\n"
+    "MERGE t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET a = 1;\n",
     // an error the script rule does not recover from ends the first batch's parse
     "SELECT 1;\n)\nGO\nSET NOCOUNT ON\nSELECT o.Status FROM dbo.Orders o\nGO\nGO\nSELECT 2\n",
 };

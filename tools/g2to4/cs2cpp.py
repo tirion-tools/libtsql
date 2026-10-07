@@ -327,6 +327,8 @@ class _State:
         self.tr, self.t, self.scope, self.mode = tr, toks, scope, mode
         self.m = tr.model
         self.last_kind = None
+        self.chain_before = None   # the significant token before the last operand (eager_logical)
+        self.eager_last = None     # eager_logical's last result and operator
 
     # -------------------------------------------------------------- helpers
     def tx(self, i):
@@ -512,10 +514,16 @@ class _State:
                 prev_sig = 'null'
                 continue
             if tk.kind in ('id', 'num', 'str', 'vstr', 'chr') or (tk.kind == 'op' and tk.text == '('):
+                before = prev_sig   # (chain may translate nested expressions, which set chain_before)
                 s, kind, i = self.chain(i, b)
+                self.chain_before = before
                 self.last_kind = kind
                 out.append(pre + s)
                 prev_sig = 'x'
+                continue
+            if tk.kind == 'op' and tk.text in ('|', '&') and self.last_kind == 'bool' and prev_sig == 'x':
+                s, i = self.eager_logical(out.pop(), tk.text, i, b)
+                out.append(s)
                 continue
             # plain operator / punctuation
             if tk.kind == 'op' and tk.text == '}' and i in pending_defaults:
@@ -525,6 +533,39 @@ class _State:
             self.last_kind = None if tk.text not in ('==', '!=') else self.last_kind
             i += 1
         return ''.join(out)
+
+    # calls that only read the parser's state
+    PURE_CALLS = {'NextTokenMatches', 'LA', 'LT'}
+    # tokens that end an operand of | or & on both sides (anything else binds tighter or looser)
+    OPERAND_BOUNDS = {None, '(', ')', '&&', '||', ',', ';', '?', ':', 'return', '{', '}', '='}
+
+    def eager_logical(self, left, op, i, b):
+        """C# `|` / `&` on bools evaluates both operands, left first; C++ compilers warn on it. With a
+        right operand that only reads (a call of PURE_CALLS) skipping it changes nothing: `||` /
+        `&&`. Otherwise both are evaluated in order into locals. Applies to whole operands only (a
+        primary on each side); the result is parenthesised, as `|` and `&` bind tighter than `&&`."""
+        before = self.chain_before   # where the left operand starts
+        if self.kd(i + 1) not in ('id', 'num') and self.tx(i + 1) != '(':
+            raise Untranslatable('C# %s on bools with an operand that is not a primary' % op)
+        right, rk, j = self.chain(i + 1, b)
+        if rk != 'bool' or before not in self.OPERAND_BOUNDS or \
+                (j < b and self.tx(j) not in self.OPERAND_BOUNDS | {'|', '&'}):
+            raise Untranslatable('C# %s on bools inside a larger expression' % op)
+        logical = '||' if op == '|' else '&&'
+        pure = all(self.t[k].kind != 'op' or self.t[k].text in ('(', ')', '.', ',') for k in range(i + 1, j)) and \
+            all(self.tx(k + 1) != '(' or self.t[k].text in self.PURE_CALLS for k in range(i + 1, j) if self.t[k].kind == 'id')
+        pre = left[:len(left) - len(left.lstrip())]
+        if pure and self.eager_last == (left, logical):
+            s = '%s %s %s)' % (left[:-1], logical, right.strip())   # a | b | c: (a || b || c)
+        elif pure:
+            s = '%s(%s %s %s)' % (pre, left.strip(), logical, right.strip())
+        else:
+            s = '%s[&] { const bool l = %s; const bool r = %s; return l %s r; }()' % (
+                pre, left.strip(), right.strip(), logical)
+        self.eager_last = (s, logical)
+        self.chain_before = before   # the combined operand starts where the left one did
+        self.last_kind = 'bool'
+        return s, j
 
     def string_switch(self, subject, lb, b):
         """switch over a string -> if/else chain (C# case labels are string constants)."""

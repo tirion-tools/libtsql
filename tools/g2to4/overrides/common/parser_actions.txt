@@ -1,0 +1,36 @@
+Hand-written C++ for parser actions, every grammar (format: tools/g2to4/convert.py). An entry
+replaces the action of the rule whose C# text has the sha.
+
+copyOption, the action after copyCredentialOption (TSql130.g:22646, TSql140.g:23237, TSql150.g and
+later :414): SqlScriptDOM tests
+    (vResult.Kind != CopyOptionKind.Credential || vResult.Kind != CopyOptionKind.ErrorFileCredential) && ValidateCopyCredential(...)
+No kind is both, so the first operand is always true and ValidateCopyCredential alone decides
+(Clang: -Wtautological-overlap-compare). The port keeps that: the always-true test is left out.
+
+=== copyOption * sha=d31ab24a
+
+    // SqlScriptDOM also tests (Kind != Credential || Kind != ErrorFileCredential), which is always
+    // true: see tools/g2to4/overrides/common/parser_actions.txt
+    if (CopyIdentifierOrValueOptionsHelper::Instance().ValidateCopyCredential(dynamic_cast<ast::CopyCredentialOption*>(vValue)))
+    {
+        vResult->set_Value(dynamic_cast<ast::CopyCredentialOption*>(vValue));
+    }
+    else
+    {
+        ThrowIncorrectSyntaxErrorException(vValue);
+    }
+=== end
+=== copyOption * sha=646d14ae
+
+        // SqlScriptDOM also tests (Kind != Credential || Kind != ErrorFileCredential), which is always
+        // true: see tools/g2to4/overrides/common/parser_actions.txt
+        if (CopyIdentifierOrValueOptionsHelper::Instance().ValidateCopyCredential(dynamic_cast<ast::CopyCredentialOption*>(vValue)))
+        {
+            vResult->set_Value(dynamic_cast<ast::CopyCredentialOption*>(vValue));
+            vResult->UpdateTokenInfo(vValue);
+        }
+        else
+        {
+            ThrowIncorrectSyntaxErrorException(vValue);
+        }
+=== end

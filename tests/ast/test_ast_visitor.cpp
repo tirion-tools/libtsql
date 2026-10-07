@@ -28,6 +28,7 @@ template <class Base>
 class LoggingVisitor : public Base {
 public:
     std::string log;
+    using Base::Visit;   // the overloads not overridden here stay visible
 
     void Visit(TSqlFragment* node) override { Add(std::string("F:") + node->TypeName()); }
     void Visit(IntegerLiteral* node) override { Add("IntegerLiteral=" + node->Value.value_or("")); Base::Visit(node); }
@@ -55,6 +56,7 @@ public:
 class IdentifierCounter : public TSqlConcreteFragmentVisitor {
 public:
     int identifiers = 0;
+    using TSqlConcreteFragmentVisitor::ExplicitVisit;
     void ExplicitVisit(Identifier* node) override {
         ++identifiers;
         TSqlConcreteFragmentVisitor::ExplicitVisit(node);
