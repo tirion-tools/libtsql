@@ -701,10 +701,10 @@ struct ScopeAnalyzer::Impl {
     }
 
     void DmlSpec(size_t e) {
-        const size_t d = depth[mainStart];
-        size_t m = mainStart;
-        while (m < e && depth[m] != d) ++m;
-        if (m >= e) return;
+        // (a CTE list that runs to the statement's end leaves mainStart past it, past the tokens too)
+        if (mainStart >= e) return;
+        const size_t m = mainStart;
+        const size_t d = depth[m];
         Spec spec;
         spec.start = m;
         spec.end = e;

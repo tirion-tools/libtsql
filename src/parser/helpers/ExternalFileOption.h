@@ -1,7 +1,7 @@
 // Ported from Microsoft SqlScriptDOM (MIT) @ eaf3a6e: SqlScriptDom/Parser/TSql/ExternalFileOption.cs
 #pragma once
 
-#include <regex>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -39,12 +39,16 @@ struct ExternalFileOption {
 
     static void CheckDelimiterValidity(const std::string& sequence, const std::string& option) {
         CheckXMLValidity(sequence, option);
-        static const std::regex hexPrefix("^0[xX]");
-        static const std::regex hexFull("^0[xX]([0-9a-fA-F]{1,4})+$");
-        if (std::regex_search(sequence, hexPrefix) && !std::regex_search(sequence, hexFull))
-            throw std::runtime_error(FormatMessage(
-                "COPY statement failed because the value provided for option '{0}' is not a valid hexadecimal. Please use the correct hexadecimal format: 0x[*]+, where each * is in the range 0-9, a-f, A-F, and the length of * is between 1 and 4.",
-                option));
+        // .NET Regex.IsMatch(sequence, "^0[xX]") and not "^0[xX]([0-9a-fA-F]{1,4})+$", whose $ also
+        // matches before a final \n
+        if (sequence.size() >= 2 && sequence[0] == '0' && (sequence[1] == 'x' || sequence[1] == 'X')) {
+            const size_t end = sequence.back() == '\n' ? sequence.size() - 1 : sequence.size();
+            auto hex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); };
+            if (end == 2 || !std::all_of(sequence.begin() + 2, sequence.begin() + end, hex))
+                throw std::runtime_error(FormatMessage(
+                    "COPY statement failed because the value provided for option '{0}' is not a valid hexadecimal. Please use the correct hexadecimal format: 0x[*]+, where each * is in the range 0-9, a-f, A-F, and the length of * is between 1 and 4.",
+                    option));
+        }
         if (option == CodeGenerationSupporter::NullValuesOption && sequence.find("','") != std::string::npos)
             throw std::runtime_error(
                 "COPY statement failed because NULL_VALUES cannot contain STRING_DELIMITER, FIELD_TERMINATOR, ROW_DELIMITER (\\n, \\r, \\r\\n) and / or ','.");

@@ -15,9 +15,13 @@ namespace tsql::editor::detail {
 template <class GeneratedLexer, class GeneratedParser>
 class GrammarImpl final : public Grammar {
 public:
+    /// A new context of the class the parser creates for rule `rule` (null: the rule has no predicates).
+    using NewContext = std::unique_ptr<antlr4::ParserRuleContext> (*)(size_t rule);
+
     GrammarImpl(SqlVersion v, int flag, const KeywordStateEntry* states, size_t nStates, const KeywordGuardEntry* guards,
                 const PredicateEntry* preds, size_t nPreds, const RuleActionsEntry* actions,
-                const ReturningActionEntry* returning, const int* predicted) {
+                const ReturningActionEntry* returning, const int* predicted, NewContext newPredicateContext)
+        : newPredicateContext_(newPredicateContext) {
         antlr4::ANTLRInputStream input("");
         GeneratedLexer lexer(&input);
         antlr4::CommonTokenStream tokens(&lexer);
@@ -116,6 +120,8 @@ public:
     }
 
 private:
+    NewContext newPredicateContext_;
+
     std::optional<Trial> RunTrial(const TokenSourceView& view, bool checkChoices) const {
         ParseSession session(*this, view, 0, view.tokens->size());
         session.SetTrial(checkChoices);
@@ -347,14 +353,22 @@ private:
             auto it = g_.predicates.find(predIndex);
             if (it == g_.predicates.end()) return kUnknown;
             // a predicate that reads rule locals runs only in the captured context (the walk runs
-            // no actions, so elsewhere its locals are not what the parse would have set)
-            antlr4::ParserRuleContext unused;   // a predicate of the tokens does not read its context
-            antlr4::ParserRuleContext* context = &unused;
+            // no actions, so elsewhere its locals are not what the parse would have set); a predicate
+            // of the tokens reads no context but runs, as in the parse, with one of its rule's class
+            // (the generated sempred downcasts to it)
+            antlr4::ParserRuleContext* context;
             if (it->second.find('?') != std::string::npos) {
                 if (locals == nullptr || locals->context == nullptr || locals->index != index ||
                     locals->context->getRuleIndex() != ruleIndex)
                     return kUnknown;
                 context = static_cast<antlr4::ParserRuleContext*>(locals->context);
+            } else {
+                if (contexts_.empty()) contexts_.resize(g_.atn->ruleToStartState.size());
+                if (ruleIndex >= contexts_.size()) return kUnknown;
+                std::unique_ptr<antlr4::ParserRuleContext>& rule = contexts_[ruleIndex];
+                if (rule == nullptr) rule = g_.newPredicateContext_(ruleIndex);
+                if (rule == nullptr) return kUnknown;
+                context = rule.get();
             }
             CaptureStream& stream = session_.Stream();
             if (probe != nullptr) {
@@ -388,6 +402,7 @@ private:
         const GrammarImpl& g_;
         ParseSession session_;
         SessionParser parser_;
+        std::vector<std::unique_ptr<antlr4::ParserRuleContext>> contexts_;   // by rule: for predicates of the tokens
     };
 };
 

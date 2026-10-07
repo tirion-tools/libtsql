@@ -226,8 +226,10 @@ void TSql80ParserBase::CheckOptionDuplication(int64_t& encountered, int newOptio
     CheckOptionDuplication(encountered, newOption, GetFirstToken(vOption));
 }
 
+// C# masks a 64-bit shift's count to its low 6 bits (an option enum value 64 and up wraps around);
+// in C++ such a shift is undefined.
 void TSql80ParserBase::CheckOptionDuplication(int64_t& encountered, int newOption, antlr4::Token* token) {
-    int64_t newOptionBit = (int64_t{1} << newOption);
+    int64_t newOptionBit = (int64_t{1} << (newOption & 63));
     if ((encountered & newOptionBit) == newOptionBit)
         ThrowParseErrorException("SQL46049", token, TSqlParserResource::SQL46049Message, TokenText(token));
     encountered |= newOptionBit;
@@ -238,7 +240,7 @@ void TSql80ParserBase::CheckOptionDuplication(uint64_t& encountered, int newOpti
 }
 
 void TSql80ParserBase::CheckOptionDuplication(uint64_t& encountered, int newOption, antlr4::Token* token) {
-    uint64_t newOptionBit = (uint64_t{1} << newOption);
+    uint64_t newOptionBit = (uint64_t{1} << (newOption & 63));   // masked as in C#, see above
     if ((encountered & newOptionBit) == newOptionBit)
         ThrowParseErrorException("SQL46049", token, TSqlParserResource::SQL46049Message, TokenText(token));
     encountered |= newOptionBit;

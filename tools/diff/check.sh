@@ -35,7 +35,10 @@ B=$(realpath -m "${1:-$P/build}")
 C=$B/chk   # this build's dumps, so checks of different build dirs can run at the same time
 mkdir -p "$C"
 CAP=(); [ -x "$P/bin/capped" ] && CAP=("$P/bin/capped")
-LIMIT=(prlimit --as=$((2 << 30)))   # per tsql_dump: a runaway aborts on its own allocation (normal peak < 200 MB)
+# Per tsql_dump: a runaway aborts on its own allocation (normal peak < 200 MB). TSQL_DUMP_LIMIT
+# replaces the command prefix; empty for sanitizer builds (ASan reserves terabytes of address space:
+# use ASAN_OPTIONS=hard_rss_limit_mb=2048 instead).
+read -ra LIMIT <<<"${TSQL_DUMP_LIMIT-prlimit --as=$((2 << 30))}"
 BUILD=(ninja -C "$B"); [ -x "$P/bin/build" ] && BUILD=("$P/bin/build" -C "$B")
 if ! log=$("${BUILD[@]}" tsql_dump tsql_bench 2>&1); then
     printf '%s\n' "$log" | grep -E 'error|FAILED' | head -20

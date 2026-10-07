@@ -1,5 +1,5 @@
-# Local fixes to the pinned ANTLR 4.13.2 C++ runtime: warnings (held to the same bar as libtsql)
-# and a missing include that breaks MSVC.
+# Local fixes to the pinned ANTLR 4.13.2 C++ runtime: warnings (held to the same bar as libtsql),
+# a missing include that breaks MSVC, and leaks and data races the sanitizers find.
 # Run by FetchContent's PATCH_COMMAND in the extracted source root (cmake -P, no other tools):
 #   cmake [-DTSQL_PATCH_HASH=<sha256 of this file>] -P antlr4-runtime.cmake
 # (TSQL_PATCH_HASH is unused here: it only puts this file's content into the patch command, so an
@@ -52,3 +52,24 @@ tsql_patch(runtime/Cpp/runtime/src/atn/ProfilingATNSimulator.cpp
 tsql_patch(runtime/Cpp/runtime/src/support/Utf8.cpp
     "      {LOW, HIGH}, {0xa0, HIGH}, {LOW, 0x9f}, {0x90, HIGH},\n      {LOW, 0x8f}, {0x0, 0x0},   {0x0, 0x0},  {0x0, 0x0},\n      {0x0, 0x0},  {0x0, 0x0},   {0x0, 0x0},  {0x0, 0x0},\n      {0x0, 0x0},  {0x0, 0x0},   {0x0, 0x0},  {0x0, 0x0},\n"
     "      // [libtsql] uint8_t values: int literals narrowed inside std::pair's constructor (MSVC C4244)\n      {LOW, HIGH}, {uint8_t{0xa0}, HIGH}, {LOW, uint8_t{0x9f}}, {uint8_t{0x90}, HIGH},\n      {LOW, uint8_t{0x8f}}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},\n")
+
+# LeakSanitizer: splitAccordingToSemanticValidity holds its two new sets in raw pointers while it
+# evaluates predicates; a predicate that throws (libtsql's editor stops a parse from inside one)
+# leaks both. Owned until returned; the caller (unchanged) takes them.
+tsql_patch(runtime/Cpp/runtime/src/atn/ParserATNSimulator.cpp
+    "  // mem-check: both pointers must be freed by the caller.\n  ATNConfigSet *succeeded(new ATNConfigSet(configs->fullCtx));\n  ATNConfigSet *failed(new ATNConfigSet(configs->fullCtx));\n"
+    "  // [libtsql] owned until returned (a predicate that throws leaked both); the caller frees them.\n  auto succeeded = std::make_unique<ATNConfigSet>(configs->fullCtx);\n  auto failed = std::make_unique<ATNConfigSet>(configs->fullCtx);\n")
+tsql_patch(runtime/Cpp/runtime/src/atn/ParserATNSimulator.cpp
+    "  return { succeeded, failed };\n"
+    "  return { succeeded.release(), failed.release() }; // [libtsql] see above\n")
+
+# ThreadSanitizer: computeReachSet adds the configurations at rule stop states of the DFA state it
+# starts from (closure_, part of the DFA that every parser of the grammar shares) to the new reach
+# set as they are, not copies. When the reach set becomes a DFA state, addDFAState's
+# optimizeConfigs writes each of its configurations' context (and ATNConfigSet::add merges into
+# them), while another thread predicting from the same DFA state reads the same objects: a data
+# race on a shared_ptr. Copies, like every other configuration computeReachSet adds; their values
+# are the same, so the predictions are.
+tsql_patch(runtime/Cpp/runtime/src/atn/ParserATNSimulator.cpp
+    "    for (const auto &c : skippedStopStates) {\n      reach->add(c, &mergeCache);\n"
+    "    for (const auto &c : skippedStopStates) {\n      reach->add(std::make_shared<ATNConfig>(*c), &mergeCache); // [libtsql] a copy: c belongs to the shared DFA\n")

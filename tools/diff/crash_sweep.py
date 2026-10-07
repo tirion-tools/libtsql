@@ -9,7 +9,10 @@ the script cut after every TRUNC_EVERY-th token, and the script without every DE
 (starting at DELETE_FIRST). 44,432 variants, the same for every version, written once to
 $P/sweep/inputs. Each version's tsql_dump (default: every version the build has) parses them
 in batches under $P/bin/capped when present, each tsql_dump limited to 2 GB of address space (a runaway
-aborts on its own allocation, exit 134, instead of being OOM-killed); when a batch dies of a signal (exit >= 128), the
+aborts on its own allocation, exit 134, instead of being OOM-killed; TSQL_DUMP_LIMIT replaces that prefix,
+empty for sanitizer builds, which limit themselves with ASAN_OPTIONS=hard_rss_limit_mb; give them
+abort_on_error=1 in ASAN_OPTIONS and UBSAN_OPTIONS too, or a report exits 1 like a parse error and is
+not counted); when a batch dies of a signal (exit >= 128), the
 first file without a dump is recorded and the batch resumes after it. Prints every crashing variant as
 `<version> <exit> <file>`; exits 1 if there is any. About 6 minutes for all seven versions (4 jobs)."""
 import argparse, glob, hashlib, os, re, shutil, subprocess, sys, tempfile
@@ -91,7 +94,8 @@ def main():
     ap.add_argument('--jobs', type=int, default=4)
     a = ap.parse_args()
     dump = a.build + '/src/parser/tsql_dump'
-    cap = ([P + '/bin/capped'] if os.access(P + '/bin/capped', os.X_OK) else []) + ['prlimit', '--as=%d' % (2 << 30)]
+    limit = os.environ.get('TSQL_DUMP_LIMIT', 'prlimit --as=%d' % (2 << 30)).split()
+    cap = ([P + '/bin/capped'] if os.access(P + '/bin/capped', os.X_OK) else []) + limit
     versions = a.version or subprocess.run([dump, '--list-versions'], capture_output=True, encoding='utf-8',
                                            check=True).stdout.split()
     os.makedirs(WORK, exist_ok=True)

@@ -386,6 +386,17 @@ def load_predicates(sources, consts):
     return preds
 
 
+def load_predicate_contexts(sources):
+    """{rule index: context class} of the rules with predicates: the generated sempred() downcasts
+    its context to the rule's class before it runs one of the rule's predicates."""
+    contexts = {}
+    for text in sources:
+        for m in re.finditer(r'case (\d+): return \w+Sempred\(antlrcpp::downCast<(\w+) \*>\(context\), predicateIndex\);',
+                             text):
+            contexts[int(m.group(1))] = m.group(2)
+    return contexts
+
+
 # ------------------------------------------------------------------------------ keyword states
 
 RULE_FN = re.compile(r'^\w+Parser::\w+Context\* \w+Parser::(\w+)\(', re.M)
@@ -699,6 +710,7 @@ def main():
         with open(path, encoding='utf-8') as f:
             sources.append(f.read())
     preds = load_predicates(sources, consts)
+    contexts = load_predicate_contexts(sources)
     states, guards = {}, {}
     for text in sources:
         found, found_guards = keyword_states(text, consts, helpers, funcs, idfuncs)
@@ -738,7 +750,8 @@ def main():
              '// state, word, mask}; predicates: {index, expression}; rule actions: {rule, number of',
              '// actions, ordinals of those that can reject the input}; returning actions: {rule, ordinal,',
              '// condition under which it returns from the rule}; predicted decisions: the decisions the',
-             '// generated code predicts with adaptivePredict.',
+             '// generated code predicts with adaptivePredict; NewPredicateContext: a context of the class',
+             '// the parser creates for a rule with predicates (its predicates run with it).',
              'static const ::tsql::editor::detail::KeywordStateEntry kKeywordStates[] = {']
     for st in sorted(states):
         words, binding = states[st]
@@ -772,6 +785,15 @@ def main():
         lines.append('    %d,' % d)
     lines.append('    -1,   // end')
     lines.append('};')
+    lines.append('std::unique_ptr<::antlr4::ParserRuleContext> NewPredicateContext(size_t rule) {')
+    lines.append('    using P = ::tsql::parser::%sParser;' % a.grammar)
+    lines.append('    switch (rule) {')
+    for rule in sorted(contexts):
+        lines.append('    case %d: return std::make_unique<P::%s>(nullptr, ::antlr4::atn::ATNState::INVALID_STATE_NUMBER);'
+                     % (rule, contexts[rule]))
+    lines.append('    default: return nullptr;')
+    lines.append('    }')
+    lines.append('}')
     out = '\n'.join(lines) + '\n'
     if not os.path.exists(a.out) or open(a.out, encoding='utf-8').read() != out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
